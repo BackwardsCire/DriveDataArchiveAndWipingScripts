@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # interactive_data_rescue.sh
 # Imaging + optional deep-scrape (auto-prompt if bad sectors) + mount (ISO/HFS/APM) + copy + ownership fix.
 
@@ -257,4 +257,3 @@ else
   echo "  Copy status: completed (see destination listing above)."
 fi
 echo "All done."
-

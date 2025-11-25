@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 umask 077
 export LC_ALL=C
@@ -367,7 +367,7 @@ smart_raw() {  # usage: smart_raw <ID> <NAME_WITH_UNDERSCORES>
 build_smart_summary() {
   if (( SMART_AVAILABLE != 0 )) || [[ ! -s "$SMART_TXT" ]]; then
     { echo "SMART Health Summary"; echo "Status: SMART unavailable (USB bridge limitation or not detected)."; } > "$SMART_SUMMARY_TXT"; return
-  fi
+  }
   local HEALTH POH PWR_CYC REALLOC PENDING UNCORR CRC TEMP ERRLOG SELFTEST
   HEALTH="$(
     awk -F': ' '
@@ -410,7 +410,7 @@ build_smart_summary
 # ====== STEP 11: Kernel messages after run ===================================
 phase "Kernel messages after run - captured to log only"
 dmesg | tail -n 120 | \
-  grep -Ev 'apparmor="DENIED".*operation="capable"|capname="(dac_read_search|dac_override)"' \
+  grep -Ev 'apparmor=\"DENIED\".*operation=\"capable\"|capname=\"(dac_read_search|dac_override)\"' \
   >> "$SESSION_LOG" 2>&1 || true
 echo "[Final dmesg output captured to session log]"
 pause_here "Final dmesg tail captured. Continue to assemble report?"
