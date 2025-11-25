@@ -36,6 +36,15 @@ Ctrl+b then d   # detach
 tmux attach -t wipe
 ```
 
+## Find the target device
+
+Before running, confirm the correct drive path:
+```bash
+lsblk -o NAME,TRAN,SIZE,MODEL,SERIAL,MOUNTPOINT
+```
+- Look for the removable/USB disk you intend to wipe (commonly `/dev/sdb`, `/dev/sdc`, etc.).
+- Avoid anything with active mountpoints or that matches your OS drive.
+
 ---
 
 ## Outputs

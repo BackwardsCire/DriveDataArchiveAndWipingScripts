@@ -41,6 +41,14 @@ chmod +x scripts/*.sh
 
 ## Quick Start
 
+### Find the right drive
+List devices and note the path (e.g., `/dev/sdb`) before running either script:
+```bash
+lsblk -o NAME,TRAN,SIZE,MODEL,SERIAL,MOUNTPOINT
+```
+- External/USB drives usually appear as `sd?` with `removable`/`usb` in the `TRAN` column.
+- Never target your OS disk (often `sda` or with mounted partitions in `MOUNTPOINT`).
+
 ### Wipe a drive for resale
 ```bash
 sudo tmux new -s wipe

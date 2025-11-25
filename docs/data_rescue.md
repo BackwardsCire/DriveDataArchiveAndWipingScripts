@@ -19,6 +19,8 @@ Guided tool for safely imaging and extracting data from damaged or legacy drives
 ```bash
 lsblk -o NAME,SIZE,MODEL,SERIAL
 ```
+- Confirm the right path (e.g., `/dev/sdb`) and avoid the OS disk (`/dev/sda` with mounted partitions).
+- `lsblk --fs` can help you see filesystems/mountpoints if you are unsure which drive is which.
 
 2) **Start in tmux**
 ```bash
