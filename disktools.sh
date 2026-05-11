@@ -70,17 +70,20 @@ Supported source media (archive workflow):
                   multi-partition rescues use scripts/interactive_data_rescue.sh.
   HFS / APM       Plain HFS / HFS+ filesystems (no partition map) are
                   handled by menu option 2 — that script auto-tries
-                  hfs and hfsplus mounts. Apple Partition Map discs
-                  (old-Mac install media, System 7-9 / early OS X HDDs)
-                  need menu option 3, which has APM-aware partition
-                  walking and an hfsutils fallback.
+                  hfs and hfsplus mounts. APM-partitioned media
+                  (old-Mac install discs / System 7-9 / early OS X
+                  HDDs) is detected automatically: option 2 first
+                  walks any HFS partitions it finds and rsyncs from
+                  the first one that mounts. If none mount, option 2
+                  prints a loud banner pointing at option 3 and keeps
+                  the raw image on disk so option 3 can walk it with
+                  hfsutils.
 
 Workflow tip:
 
-  Always try option 2 first. If it says "Could not mount image; copying
-  raw image only", THEN try option 3 against the same source. Option 3
-  is only needed for the small minority of media where option 2's
-  auto-detection isn't enough.
+  Always try option 2 first. Option 3 is only needed when option 2
+  prints the "APM rescue required" banner (or when you want to walk
+  multiple APM data partitions by hand).
 
 Wipe workflow targets:
 

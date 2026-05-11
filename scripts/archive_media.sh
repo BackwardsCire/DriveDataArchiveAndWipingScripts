@@ -387,6 +387,7 @@ image_source() {
 # operator inspects the artifacts after the run and decides what to keep.
 # FALLBACK_ARTIFACTS is the list of paths to mention in the final report.
 FALLBACK_ARTIFACTS=()
+APM_NEEDS_RESCUE=0
 run_fallbacks() {
   local dev="$1" mtype="$2"
   (( UNRESOLVED_BYTES > 0 )) || { log "No unresolved sectors remain; skipping fallback tools."; return; }
@@ -481,6 +482,118 @@ _cleanup_mount() {
   rmdir "$mnt" 2>/dev/null || true
 }
 
+# Inspect an image with parted -m and return its partition-table type
+# (the 6th colon-separated field of the device line). Empty if parted
+# can't read the image. Values seen in the wild: msdos, gpt, mac, loop.
+partition_table_type() {
+  local image="$1"
+  parted -m -s "$image" unit B print 2>/dev/null \
+    | awk -F: 'NR==2 {print $6; exit}'
+}
+
+# Walk an Apple Partition Map image looking for HFS/HFS+ data partitions
+# and mount the first one that mounts cleanly. APM partition 1 is always
+# the partition map descriptor itself; data partitions are typically
+# named "Apple_HFS" / "Apple_HFSX" in the parted NAME column (field 6),
+# and may or may not populate the FS column (field 5).
+#
+# Args: $1=image, $2=mountpoint
+# Returns: 0 on successful mount + sets APM_MOUNTED_OFFSET / APM_MOUNTED_FS
+#          for the report; non-zero if no HFS partition mounted.
+APM_MOUNTED_OFFSET=""
+APM_MOUNTED_FS=""
+APM_HFS_PART_COUNT=0
+walk_apm_hfs() {
+  local image="$1" mnt="$2"
+  local parted_out
+  parted_out="$(parted -m -s "$image" unit B print 2>/dev/null || true)"
+  [[ -z "$parted_out" ]] && return 1
+
+  # Collect every partition line whose FS or NAME smells like HFS.
+  # Format per line: NUMBER:START:END:SIZE:FS:NAME:FLAGS
+  local hfs_lines
+  hfs_lines="$(awk -F: 'NR>2 && (tolower($5) ~ /hfs/ || tolower($6) ~ /hfs/) {print}' <<<"$parted_out")"
+  if [[ -z "$hfs_lines" ]]; then
+    return 1
+  fi
+  APM_HFS_PART_COUNT="$(printf '%s\n' "$hfs_lines" | grep -c .)"
+
+  while IFS= read -r line; do
+    local num off raw_fs name
+    num="$(awk -F: '{print $1}' <<<"$line")"
+    off="$(awk -F: '{sub(/B$/,"",$2); print $2}' <<<"$line")"
+    raw_fs="$(awk -F: '{print $5}' <<<"$line")"
+    name="$(awk -F: '{print $6}' <<<"$line")"
+    [[ -z "$off" || "$off" == "0" ]] && continue
+    log "APM partition ${num} (${name:-no-name}, parted-fs=${raw_fs:-?}, offset=${off}B): trying HFS mount"
+    for fstype in hfsplus hfs; do
+      if mount -o "loop,ro,offset=${off}" -t "$fstype" "$image" "$mnt" 2>/dev/null; then
+        APM_MOUNTED_OFFSET="$off"
+        APM_MOUNTED_FS="$fstype"
+        log "Mounted APM partition ${num} as ${fstype} at offset ${off}B"
+        return 0
+      fi
+    done
+  done <<<"$hfs_lines"
+
+  return 1
+}
+
+# Print a hard-to-miss banner pointing the operator at menu option 3 when
+# we can see this is APM-partitioned but can't mount any HFS partition
+# directly. Keeps the image on disk (cleanup is gated separately) so the
+# rescue script has something to walk.
+apm_loud_prompt() {
+  local image="$1" parted_dump="$2"
+  cat >&2 <<EOF
+
+
+****************************************************************************
+*  APPLE PARTITION MAP (APM) DETECTED — manual rescue recommended           *
+****************************************************************************
+
+This image has an Apple Partition Map (parted reports table type 'mac').
+That's the layout used by old-Mac install discs, System 7-9 / early
+OS X HDDs, and some hybrid Mac/PC CDs.
+
+I imaged it cleanly, but I could not mount its HFS/HFS+ partitions via the
+kernel here. Reasons range from "kernel hfs driver doesn't know this exact
+variant" to "the volume needs hfsutils to walk".
+
+What to do next:
+
+  1. KEEP THE IMAGE. It is at:
+        ${image}
+     Do NOT answer 'y' to the cleanup prompt at the end of this run.
+
+  2. Run menu option 3 (Rescue Apple Partition Map) against the image:
+        sudo ./disktools.sh rescue
+     When asked for the source, point it at ${image} interpreted as a
+     loop device — set it up first:
+        sudo losetup --show -fP --read-only ${image}
+     parted will then see the APM partitions and the rescue script's
+     hfsutils fallback can extract files even when the kernel can't
+     mount the volume.
+
+  3. Or extract a single HFS partition manually using the parted output
+     below (offset = field 2, in bytes):
+
+EOF
+  printf '%s\n' "$parted_dump" >&2
+  cat >&2 <<EOF
+
+        sudo dd if=${image} of=hfs-part.img bs=1 skip=<OFFSET> count=<SIZE>
+        sudo hmount hfs-part.img && hls -l    # browse with hfsutils
+        # or: sudo mount -o loop,ro -t hfsplus hfs-part.img /mnt/x
+
+  4. The session log + raw image are tagged in this run's report so you
+     can come back to them. See: ${SESSION_LOG}
+
+****************************************************************************
+
+EOF
+}
+
 copy_to_nas() {
   local image="$1" case_dir="$2"
   local mnt rc=0
@@ -497,6 +610,21 @@ copy_to_nas() {
       mounted=1; break
     fi
   done
+
+  local table_type=""
+  if (( mounted == 0 )); then
+    table_type="$(partition_table_type "$image")"
+    log "Partition table type: ${table_type:-unknown}"
+
+    if [[ "$table_type" == "mac" ]]; then
+      # APM-partitioned image. Walk HFS/HFS+ partitions specifically
+      # before falling back to the first-usable-partition probe — APM's
+      # partition 1 is always the partition map descriptor, never data.
+      if walk_apm_hfs "$image" "$mnt"; then
+        mounted=1
+      fi
+    fi
+  fi
 
   if (( mounted == 0 )); then
     # Probe the partition table for the first usable partition. parted -m
@@ -518,7 +646,14 @@ copy_to_nas() {
   fi
 
   if (( mounted == 0 )); then
-    warn "Could not mount image; copying raw image only."
+    if [[ "$table_type" == "mac" ]]; then
+      # APM detected but no HFS partition mounted automatically. Print
+      # the loud rescue-helper guidance and keep the raw image.
+      apm_loud_prompt "$image" "$(parted -m -s "$image" unit B print 2>/dev/null || true)"
+      APM_NEEDS_RESCUE=1
+    else
+      warn "Could not mount image; copying raw image only."
+    fi
     cp -av "$image" "$case_dir/"
     fix_owner "$case_dir"
     _cleanup_mount "$mnt"
@@ -569,6 +704,14 @@ write_report() {
     if (( ${#FALLBACK_ARTIFACTS[@]} > 0 )); then
       echo "---- Fallback artifacts (kept separate; do not merge blindly) ----"
       printf '  %s\n' "${FALLBACK_ARTIFACTS[@]}"
+      echo
+    fi
+    if (( APM_NEEDS_RESCUE == 1 )); then
+      echo "---- APM rescue required ----"
+      echo "Image is Apple Partition Map (table type 'mac') and could not"
+      echo "be auto-mounted. Image kept at: ${IMAGE}"
+      echo "Next step: sudo ./disktools.sh rescue   (menu option 3)"
+      echo "See session log for the full APM banner with parted output."
       echo
     fi
     echo "---- Destination listing ----"
@@ -645,7 +788,10 @@ cp -f "$REPORT" "${REPORT_ROOT}/${BASE}-report.txt" || true
 fix_owner "${REPORT_ROOT}"
 
 phase "Cleanup"
-if confirm "Delete local image and mapfile (${IMAGE} / ${MAPFILE})?" N; then
+if (( APM_NEEDS_RESCUE == 1 )); then
+  log "APM rescue is pending — keeping image at ${IMAGE} (skipping cleanup prompt)."
+  log "Run: sudo ./disktools.sh rescue   to walk the APM partitions."
+elif confirm "Delete local image and mapfile (${IMAGE} / ${MAPFILE})?" N; then
   rm -f -- "$IMAGE" "$MAPFILE" 2>/dev/null || true
   log "Local scratch image+mapfile cleaned."
   if (( ${#FALLBACK_ARTIFACTS[@]} > 0 )); then
