@@ -188,6 +188,6 @@ case "$MODE" in
       fi
     done
     echo
-    echo "Tip: run 'scripts/archive_media.sh <device>' to image one of these to the NAS."
+    echo "Tip: run 'scripts/archive_media.sh <device>' to image one of these to the configured archive destination."
     ;;
 esac
