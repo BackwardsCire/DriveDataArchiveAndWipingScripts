@@ -78,6 +78,12 @@ Supported source media (archive workflow):
                   prints a loud banner pointing at option 3 and keeps
                   the raw image on disk so option 3 can walk it with
                   hfsutils.
+  Hybrid Mac/PC   CDs/DVDs with BOTH an ISO9660 (or UDF) view AND an
+                  HFS view (old shareware/game/install discs). Option
+                  2 detects these automatically and rsyncs each view
+                  into its own subdirectory under the case dir
+                  (iso9660/ + hfs/), so Mac-only files and resource
+                  forks aren't silently dropped.
 
 Workflow tip:
 

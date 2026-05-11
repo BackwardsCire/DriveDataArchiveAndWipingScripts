@@ -388,6 +388,7 @@ image_source() {
 # FALLBACK_ARTIFACTS is the list of paths to mention in the final report.
 FALLBACK_ARTIFACTS=()
 APM_NEEDS_RESCUE=0
+HYBRID_DISC=0
 run_fallbacks() {
   local dev="$1" mtype="$2"
   (( UNRESOLVED_BYTES > 0 )) || { log "No unresolved sectors remain; skipping fallback tools."; return; }
@@ -603,11 +604,11 @@ copy_to_nas() {
   fs_desc="$(file -b "$image" 2>/dev/null || echo unknown)"
   log "Image FS guess: $fs_desc"
 
-  local mounted=0
+  local mounted=0 primary_fs=""
   for fstype in iso9660 udf vfat ntfs-3g hfsplus hfs ext4 ext3 ext2; do
     if mount -o loop,ro -t "$fstype" "$image" "$mnt" 2>/dev/null; then
       log "Mounted $image as $fstype"
-      mounted=1; break
+      mounted=1; primary_fs="$fstype"; break
     fi
   done
 
@@ -660,6 +661,72 @@ copy_to_nas() {
     return 1
   fi
 
+  # Hybrid Mac/PC disc detection: ISO9660 / UDF primary mount succeeded,
+  # but the same image may also have an HFS view (APM table OR an
+  # HFS-flavored partition). Old shareware/game/install CDs often store
+  # Mac-specific apps + resource forks on the HFS side that the
+  # ISO9660 side doesn't even list. Capture both views into subdirs.
+  local is_hybrid=0
+  if [[ "$primary_fs" == "iso9660" || "$primary_fs" == "udf" ]]; then
+    local hybrid_table_type
+    hybrid_table_type="$(partition_table_type "$image")"
+    if [[ "$hybrid_table_type" == "mac" ]]; then
+      is_hybrid=1
+    elif parted -m -s "$image" unit B print 2>/dev/null \
+           | awk -F: 'NR>2 && (tolower($5) ~ /hfs/ || tolower($6) ~ /hfs/) {found=1} END{exit !found}'; then
+      is_hybrid=1
+    fi
+    (( is_hybrid == 1 )) && log "Hybrid Mac/PC disc detected (primary=${primary_fs}, HFS view also present)."
+  fi
+
+  if (( is_hybrid == 1 )); then
+    HYBRID_DISC=1
+    mkdir -p "$case_dir/${primary_fs}" "$case_dir/hfs"
+
+    log "rsync (${primary_fs} view) $mnt/ -> $case_dir/${primary_fs}/"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      log "DRY RUN: would rsync ${primary_fs} view"
+    else
+      rsync -aHAX --info=progress2 "$mnt/" "$case_dir/${primary_fs}/" \
+        || { warn "rsync (${primary_fs} view) reported issues; see log."; rc=1; }
+    fi
+    _cleanup_mount "$mnt"
+
+    # Mount the HFS view. Prefer the APM walker if the table is 'mac';
+    # otherwise try a direct hfsplus/hfs mount at offset 0 (some hybrid
+    # CDs put the HFS volume header at sector 0 without an APM map).
+    mnt="$(mktemp -d -t archive-mnt-XXXX)"
+    local hfs_mounted=0
+    if [[ "$hybrid_table_type" == "mac" ]] && walk_apm_hfs "$image" "$mnt"; then
+      hfs_mounted=1
+    else
+      for fstype in hfsplus hfs; do
+        if mount -o loop,ro -t "$fstype" "$image" "$mnt" 2>/dev/null; then
+          log "Mounted hybrid HFS view as $fstype (offset 0)"
+          hfs_mounted=1; break
+        fi
+      done
+    fi
+
+    if (( hfs_mounted == 1 )); then
+      log "rsync (hfs view) $mnt/ -> $case_dir/hfs/"
+      if [[ "$DRY_RUN" == "1" ]]; then
+        log "DRY RUN: would rsync hfs view"
+      else
+        rsync -aHAX --info=progress2 "$mnt/" "$case_dir/hfs/" \
+          || { warn "rsync (hfs view) reported issues; see log."; rc=1; }
+      fi
+    else
+      warn "Hybrid disc detected but HFS view did not mount. ${primary_fs} captured at $case_dir/${primary_fs}/."
+      warn "Image kept at $image — run option 3 to extract the Mac side manually."
+      APM_NEEDS_RESCUE=1
+      rmdir "$case_dir/hfs" 2>/dev/null || true
+    fi
+    fix_owner "$case_dir"
+    _cleanup_mount "$mnt"
+    return $rc
+  fi
+
   log "rsync $mnt/ -> $case_dir/"
   if [[ "$DRY_RUN" == "1" ]]; then
     log "DRY RUN: would rsync"
@@ -704,6 +771,16 @@ write_report() {
     if (( ${#FALLBACK_ARTIFACTS[@]} > 0 )); then
       echo "---- Fallback artifacts (kept separate; do not merge blindly) ----"
       printf '  %s\n' "${FALLBACK_ARTIFACTS[@]}"
+      echo
+    fi
+    if (( HYBRID_DISC == 1 )); then
+      echo "---- Hybrid Mac/PC disc ----"
+      echo "Both views captured into separate subdirectories of:"
+      echo "  ${case_dir}/"
+      echo "    iso9660/  (or udf/) — PC-readable view"
+      echo "    hfs/                 — Mac view (Mac-only files + resource forks)"
+      echo "Content typically overlaps but is not identical; Mac-only items"
+      echo "(installers, classic Mac apps) usually live only under hfs/."
       echo
     fi
     if (( APM_NEEDS_RESCUE == 1 )); then
