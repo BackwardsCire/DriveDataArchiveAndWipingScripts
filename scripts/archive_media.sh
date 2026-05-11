@@ -33,7 +33,12 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 PROJ_DIR="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 
-OWNER="${SUDO_USER:-$USER}"
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+  OWNER="$SUDO_USER"
+else
+  OWNER="$(stat -c '%U' "$PROJ_DIR" 2>/dev/null || echo "${USER}")"
+  [[ -z "$OWNER" || "$OWNER" == "UNKNOWN" ]] && OWNER="${USER}"
+fi
 OWNER_HOME="$(getent passwd "${OWNER}" | cut -d: -f6)"
 [[ -z "$OWNER_HOME" ]] && OWNER_HOME="$(eval echo "~${OWNER}")"
 
@@ -228,6 +233,21 @@ guard_device() {
     lsblk -ln -o NAME,MOUNTPOINT "$dev" | awk '$2!=""{print "  /dev/"$1" -> "$2}'
     confirm "Unmount it now?" Y || fatal "Aborted by user."
     while read -r p; do umount -v "/dev/$p" || true; done < <(lsblk -ln -o NAME,MOUNTPOINT "$dev" | awk '$2!=""{print $1}')
+  fi
+}
+
+guard_media_present() {
+  local dev="$1" mtype="$2" size_bytes short sectors
+  size_bytes="$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)"
+
+  if [[ "$mtype" == "cd" || "$mtype" == "dvd" || "$mtype" == "optical" ]]; then
+    short="${dev##*/}"
+    sectors="$(cat "/sys/block/${short}/size" 2>/dev/null || echo 0)"
+    if [[ "$sectors" == "0" || "$size_bytes" == "0" ]]; then
+      fatal "$dev reports 0 bytes / no optical medium. Eject and reinsert the disc, wait for spin-up, then run './disktools.sh detect' until FS/STATE is not 'no medium'."
+    fi
+  elif [[ "$size_bytes" == "0" ]]; then
+    fatal "$dev reports 0 bytes. Refusing to image an empty/no-media device."
   fi
 }
 
@@ -597,6 +617,7 @@ fi
 
 case "$MTYPE" in cd|dvd|zip|hdd|optical) ;; *) fatal "Bad media type: $MTYPE" ;; esac
 [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || fatal "Case name must match [A-Za-z0-9._-]"
+guard_media_present "$SRC" "$MTYPE"
 
 BASE="${MTYPE}-${NAME}-${TS}"
 CASE_DIR="${NAS_DEST}/${BASE}"

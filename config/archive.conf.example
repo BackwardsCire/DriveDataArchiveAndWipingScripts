@@ -31,7 +31,7 @@ NAS_NFS_OPTS="vers=4,nofail"
 
 # ---- Local scratch (where the .img and ddrescue mapfile live) ------------
 # ddrescue is heavy I/O — keep this on a fast local disk, NOT on the NAS.
-SCRATCH_DIR="$HOME/recovery"
+SCRATCH_DIR="~/recovery"
 
 # ---- Recovery tuning ------------------------------------------------------
 # Number of retry passes for the standard ddrescue retry phase.
@@ -57,4 +57,4 @@ FALLBACK_TOOLS="dvdisaster,safecopy"
 # ---- Reporting ------------------------------------------------------------
 # Where session logs and per-case reports go on the LOCAL machine.
 # A copy of the report is also written into the NAS case directory.
-REPORT_ROOT="$HOME/drive_reports"
+REPORT_ROOT="~/drive_reports"

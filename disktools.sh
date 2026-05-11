@@ -21,7 +21,12 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 SCRIPTS="${SCRIPT_DIR}/scripts"
 
-OWNER="${SUDO_USER:-$USER}"
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+  OWNER="$SUDO_USER"
+else
+  OWNER="$(stat -c '%U' "$SCRIPT_DIR" 2>/dev/null || echo "${USER}")"
+  [[ -z "$OWNER" || "$OWNER" == "UNKNOWN" ]] && OWNER="${USER}"
+fi
 OWNER_HOME="$(getent passwd "${OWNER}" | cut -d: -f6)"
 [[ -z "$OWNER_HOME" ]] && OWNER_HOME="$HOME"
 REPORTS="${OWNER_HOME}/drive_reports"

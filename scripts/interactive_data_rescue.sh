@@ -10,7 +10,14 @@ set -Eeuo pipefail
 umask 077
 
 # Resolve invoking user + home even under sudo
-OWNER="${SUDO_USER:-$USER}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+PROJ_DIR="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+  OWNER="$SUDO_USER"
+else
+  OWNER="$(stat -c '%U' "$PROJ_DIR" 2>/dev/null || echo "${USER}")"
+  [[ -z "$OWNER" || "$OWNER" == "UNKNOWN" ]] && OWNER="${USER}"
+fi
 OWNER_HOME="$(getent passwd "${OWNER}" | cut -d: -f6)"
 [[ -z "${OWNER_HOME}" ]] && OWNER_HOME="$(eval echo "~${OWNER}")"
 
