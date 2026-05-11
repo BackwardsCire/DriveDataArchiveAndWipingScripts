@@ -1,6 +1,10 @@
 #! /usr/bin/env bash
 # interactive_data_rescue.sh
 # Imaging + optional deep-scrape (auto-prompt if bad sectors) + mount (ISO/HFS/APM) + copy + ownership fix.
+#
+# Usage:
+#   sudo ./scripts/interactive_data_rescue.sh
+#   ./scripts/interactive_data_rescue.sh --check
 
 set -Eeuo pipefail
 umask 077
@@ -22,26 +26,58 @@ IMAGING_RC=0
 DEEP_RC=0
 COPY_RC=0
 
-require() { command -v "$1" &>/dev/null || { echo "Missing: $1"; MISSING=1; }; }
-MISSING=0
-require ddrescue      || true   # pkg: gddrescue
-require ddrescuelog   || true   # comes with gddrescue; used to read mapfile
-require parted        || true
-require file          || true
-require awk           || true
-require grep          || true
-require sed           || true
-require mount         || true
-require lsblk         || true
-require hmount        || true   # pkg: hfsutils
-require hcopy         || true
-require humount       || true
-require fsck.hfs      || true   # pkg: hfsprogs
-require rsync         || true
-if [[ "${MISSING}" == "1" ]]; then
+usage() {
+  sed -n '2,7p' "$0"
+}
+
+# Required tools — any missing here is fatal. Optional tools (HFS helpers)
+# are checked only at the point of use; their absence just narrows what
+# filesystems we can mount and copy from.
+need() { command -v "$1" &>/dev/null || MISSING+=" $1"; }
+have() { command -v "$1" &>/dev/null; }
+MISSING=""
+for t in ddrescue ddrescuelog parted file awk grep sed mount lsblk rsync; do need "$t"; done
+
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  --check)
+    if [[ -n "$MISSING" ]]; then
+      echo "Missing required tool(s):${MISSING}"
+      echo "Install on Ubuntu:"
+      echo "  sudo apt update && sudo apt install -y gddrescue parted file rsync util-linux"
+      exit 1
+    fi
+    echo "Data rescue preflight OK."
+    echo "Owner:        ${OWNER}"
+    echo "Report root:  ${REPORT_ROOT}"
+    echo "Recovery dir: ${RECOVERY_DIR}"
+    echo "Output root:  ${OUTPUT_ROOT}"
+    echo "Optional HFS helpers:"
+    for t in hmount hcopy humount fsck.hfs; do
+      if have "$t"; then echo "  OK $t"; else echo "  missing $t"; fi
+    done
+    exit 0
+    ;;
+  "")
+    ;;
+  *)
+    echo "Unknown argument: $1" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
+
+if [[ -n "$MISSING" ]]; then
+  echo "Missing required tool(s):${MISSING}"
   echo
-  echo "Install deps on Ubuntu:"
-  echo "  sudo apt update && sudo apt install -y gddrescue parted hfsprogs hfsutils file rsync"
+  echo "Install on Ubuntu:"
+  echo "  sudo apt update && sudo apt install -y gddrescue parted file rsync util-linux"
+  echo
+  echo "Optional (for old-Mac HFS/HFS+ media):"
+  echo "  sudo apt install -y hfsprogs hfsutils"
   exit 1
 fi
 
@@ -162,7 +198,8 @@ else
       mounted_raw="yes"
       if ! copy_from_mount "${MNT_DIR}" "${DEST}"; then
         echo "   Attempting hfsutils fallback copy."
-        if hmount "${IMAGE}" 1 2>/dev/null; then
+        if ! have hmount; then echo "   (hfsutils not installed; install hfsutils to enable this fallback)"
+        elif hmount "${IMAGE}" 1 2>/dev/null; then
           hcopy -r : "${DEST}/" || true
           humount || true
           fix_ownership "${DEST}"
@@ -178,7 +215,10 @@ else
     PARTED=$(parted -m -s "${IMAGE}" unit B print || true)
     echo "${PARTED}"
 
-    HFS_LINE=$(echo "${PARTED}" | awk -F: 'tolower($6) ~ /^hfs/ {print; exit}')
+    # Match HFS in either the FS column ($5, e.g. "hfs+", "hfsplus") or the
+    # NAME column ($6, which on Apple Partition Map images is typically
+    # "Apple_HFS" / "Apple_HFSX" — never starts with "hfs").
+    HFS_LINE=$(echo "${PARTED}" | awk -F: 'tolower($5) ~ /hfs/ || tolower($6) ~ /hfs/ {print; exit}')
     if [[ -n "${HFS_LINE}" ]]; then
       START_B=$(echo "${HFS_LINE}" | awk -F: '{print $2}' | sed 's/B$//')
       echo "==> Found HFS partition start at ${START_B} bytes."
@@ -192,10 +232,11 @@ else
             HFS_INDEX=$(
               echo "${PARTED}" \
                 | awk -F: -v tgt="$(echo "${HFS_LINE}" | awk -F: '{print $1}')" '
-                   tolower($6) ~ /^hfs/ {i++; if ($1==tgt) {print i; exit}}'
+                   tolower($5) ~ /hfs/ || tolower($6) ~ /hfs/ {i++; if ($1==tgt) {print i; exit}}'
             )
             [[ -z "${HFS_INDEX}" ]] && HFS_INDEX=1
-            if hmount "${IMAGE}" "${HFS_INDEX}" 2>/dev/null; then
+            if ! have hmount; then echo "   (hfsutils not installed; install hfsutils to enable this fallback)"
+            elif hmount "${IMAGE}" "${HFS_INDEX}" 2>/dev/null; then
               hcopy -r : "${DEST}/" || true
               humount || true
               fix_ownership "${DEST}"
@@ -208,19 +249,25 @@ else
 
       if [[ -z "${mounted}" ]]; then
         echo "!! Kernel mount failed; trying hfsutils only."
-        HFS_INDEX=$(
-          echo "${PARTED}" \
-            | awk -F: 'tolower($6) ~ /^hfs/ {i++; print i; exit}'
-        )
-        [[ -z "${HFS_INDEX}" ]] && HFS_INDEX=1
-        if hmount "${IMAGE}" "${HFS_INDEX}"; then
-          hcopy -r : "${DEST}/" || true
-          humount || true
-          fix_ownership "${DEST}"
+        if ! have hmount; then
+          echo "   (hfsutils not installed; install hfsutils for the offline mode.)"
+          echo "   To extract the HFS partition manually:"
+          echo "     dd if='${IMAGE}' of='${RECOVERY_DIR}/${BASE}-hfs-part.img' bs=1 skip=${START_B}"
         else
-          echo "!! hfsutils also failed. Consider extracting the partition and fsck.hfs:"
-          echo "  dd if='${IMAGE}' of='${RECOVERY_DIR}/${BASE}-hfs-part.img' bs=1 skip=${START_B}"
-          echo "  fsck.hfs -n '${RECOVERY_DIR}/${BASE}-hfs-part.img'"
+          HFS_INDEX=$(
+            echo "${PARTED}" \
+              | awk -F: 'tolower($5) ~ /hfs/ || tolower($6) ~ /hfs/ {i++; print i; exit}'
+          )
+          [[ -z "${HFS_INDEX}" ]] && HFS_INDEX=1
+          if hmount "${IMAGE}" "${HFS_INDEX}"; then
+            hcopy -r : "${DEST}/" || true
+            humount || true
+            fix_ownership "${DEST}"
+          else
+            echo "!! hfsutils also failed. Consider extracting the partition and fsck.hfs:"
+            echo "  dd if='${IMAGE}' of='${RECOVERY_DIR}/${BASE}-hfs-part.img' bs=1 skip=${START_B}"
+            echo "  fsck.hfs -n '${RECOVERY_DIR}/${BASE}-hfs-part.img'"
+          fi
         fi
       fi
     else

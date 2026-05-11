@@ -1,0 +1,60 @@
+# archive.conf — copy to archive.conf and fill in for your environment.
+# Sourced by scripts/archive_media.sh.
+
+# ---- Archive destination --------------------------------------------------
+# Where recovered files (and per-case reports) should land.
+# Default is local mode for the "no NAS" setup: write to this host and share
+# /srv/legacy-media over SMB/CIFS with `sudo ./disktools.sh setup-share`.
+NAS_DEST="/srv/legacy-media"
+
+# How the NAS is reached. One of: cifs | nfs | mounted | none
+#   cifs     — script will mount it via mount.cifs using the credentials below.
+#   nfs      — script will mount it via mount -t nfs using NAS_NFS_EXPORT.
+#   mounted  — assume already mounted (e.g. via /etc/fstab); script will only verify.
+#   none     — local path; no mount step. Default for local Samba sharing.
+NAS_TRANSPORT="none"
+
+# CIFS settings (only used when NAS_TRANSPORT=cifs)
+NAS_CIFS_SHARE="//nas.lan/archive"
+NAS_CIFS_MOUNTPOINT="/mnt/nas"
+NAS_CIFS_CREDENTIALS="/root/.smbcredentials-nas"   # file with username=, password=, domain=
+# uid/gid should match the non-root user who will read the copied files.
+ARCHIVE_OWNER="${SUDO_USER:-$USER}"
+ARCHIVE_UID="$(id -u "$ARCHIVE_OWNER" 2>/dev/null || id -u)"
+ARCHIVE_GID="$(id -g "$ARCHIVE_OWNER" 2>/dev/null || id -g)"
+NAS_CIFS_OPTS="vers=3.1.1,uid=${ARCHIVE_UID},gid=${ARCHIVE_GID},iocharset=utf8,nofail,_netdev"
+
+# NFS settings (only used when NAS_TRANSPORT=nfs)
+NAS_NFS_EXPORT="nas.lan:/volume1/archive"
+NAS_NFS_MOUNTPOINT="/mnt/nas"
+NAS_NFS_OPTS="vers=4,nofail"
+
+# ---- Local scratch (where the .img and ddrescue mapfile live) ------------
+# ddrescue is heavy I/O — keep this on a fast local disk, NOT on the NAS.
+SCRATCH_DIR="$HOME/recovery"
+
+# ---- Recovery tuning ------------------------------------------------------
+# Number of retry passes for the standard ddrescue retry phase.
+RETRIES=4
+
+# Number of retry passes for the deep-scrape (reverse-direction) phase.
+DEEP_RETRIES=16
+
+# Automatically run the deep-scrape pass if any bad sectors were reported.
+# Set to empty string if you prefer to be prompted.
+AUTO_DEEP_SCRAPE="1"
+
+# Watchdog for each ddrescue pass. Examples: 90m, 3h, 12h.
+# Set to empty string or 0 to disable. If a pass times out, the mapfile is
+# kept and the script continues with whatever was recovered so far.
+DDRESCUE_PASS_TIMEOUT="3h"
+
+# Optional fallback tools to try after ddrescue if bad sectors remain.
+# Comma-separated, in order. Available: dvdisaster, cdparanoia, safecopy
+# Leave empty to skip all fallbacks.
+FALLBACK_TOOLS="dvdisaster,safecopy"
+
+# ---- Reporting ------------------------------------------------------------
+# Where session logs and per-case reports go on the LOCAL machine.
+# A copy of the report is also written into the NAS case directory.
+REPORT_ROOT="$HOME/drive_reports"

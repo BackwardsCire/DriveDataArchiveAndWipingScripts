@@ -1,5 +1,5 @@
 #! /usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 umask 077
 export LC_ALL=C
 
@@ -50,9 +50,13 @@ pause_here() {
   fi
 }
 
-# Save under the invoking user's home even with sudo
-USER_HOME="${SUDO_USER:+/home/$SUDO_USER}"
-USER_HOME="${USER_HOME:-$HOME}"
+# Save under the invoking user's home even with sudo (handles non-/home/$USER homes)
+if [[ -n "${SUDO_USER:-}" ]]; then
+  USER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+  [[ -z "$USER_HOME" ]] && USER_HOME="$(eval echo "~${SUDO_USER}")"
+else
+  USER_HOME="$HOME"
+fi
 WORKDIR="${USER_HOME}/drive_reports"
 mkdir -p "$WORKDIR"
 
@@ -76,8 +80,8 @@ else
   [[ -b "$DRIVE" ]] || { echo "Error: $DRIVE is not a block device."; exit 1; }
 fi
 
-# Ubuntu 25.04: util-linux (script/findmnt), usbutils (lsusb)
-require_cmds=( smartctl lsblk awk sed grep badblocks nwipe enscript ps2pdf nvme wipefs script findmnt lsusb dmesg stdbuf udevadm dpkg-query )
+# Ubuntu 25.04: util-linux (findmnt), usbutils (lsusb)
+require_cmds=( smartctl lsblk awk sed grep badblocks nwipe enscript ps2pdf nvme wipefs findmnt lsusb dmesg stdbuf udevadm dpkg-query )
 missing=(); for c in "${require_cmds[@]}"; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
 if (( ${#missing[@]} )); then
   echo "Missing required command(s): ${missing[*]}"
@@ -150,9 +154,13 @@ lsblk -d -o NAME,SIZE,MODEL,SERIAL,WWN "$DRIVE"
 echo; echo "Model: ${MODEL:-unknown}"; echo "Serial: ${SERIAL:-unknown}"; echo "WWN: ${WWN:-unknown}"
 
 echo
-echo "!!! DANGEROUS: This will IRREVERSIBLY WIPE $DRIVE !!!"
-read -r -p "Type EXACTLY 'YES' to proceed: " CONFIRM
-[[ "$CONFIRM" == "YES" ]] || { echo "Aborted."; exit 1; }
+if [[ "$DRY_RUN" = "1" ]]; then
+  echo "DRY RUN: no wipe, wipefs, badblocks, or SMART self-test will modify $DRIVE."
+else
+  echo "!!! DANGEROUS: This will IRREVERSIBLY WIPE $DRIVE !!!"
+  read -r -p "Type EXACTLY 'YES' to proceed: " CONFIRM
+  [[ "$CONFIRM" == "YES" ]] || { echo "Aborted."; exit 1; }
+fi
 
 # Unmount again (belt & suspenders)
 mapfile -t PARTS < <(lsblk -ln -o NAME,MOUNTPOINT "$DRIVE" | awk '$2!=""{print $1}')
@@ -351,8 +359,15 @@ if (( SMART_AVAILABLE == 0 )); then
   if [[ "$DRY_RUN" = "1" ]]; then
     echo "DRY RUN: Skipping actual SMART self-test."
   else
+    # Get the drive's own estimate of polling time (in minutes) and wait that
+    # long with a small cushion. Fall back to 120s if the drive doesn't report.
+    poll_min="$($SMARTCTL_BIN -c "$DRIVE" 2>/dev/null \
+      | awk '/Short self-test routine/{getline; if ($0 ~ /\([ \t]*[0-9]+\)/) {gsub(/[^0-9]/,"",$0); print; exit}}')"
+    [[ -z "$poll_min" || ! "$poll_min" =~ ^[0-9]+$ ]] && poll_min=2
+    wait_s=$(( poll_min * 60 + 15 ))
     $SMARTCTL_BIN -t short "$DRIVE" || true
-    echo "Waiting ~2 minutes for SMART short test to complete..."; sleep 120 || true
+    echo "Waiting ${wait_s}s for SMART short self-test (drive estimate ${poll_min} min)..."
+    sleep "$wait_s" || true
     phase "SMART post-short snapshot"; $SMARTCTL_BIN -a "$DRIVE" >> "$SMART_TXT" || true
   fi
 else
@@ -366,8 +381,9 @@ smart_raw() {  # usage: smart_raw <ID> <NAME_WITH_UNDERSCORES>
 }
 build_smart_summary() {
   if (( SMART_AVAILABLE != 0 )) || [[ ! -s "$SMART_TXT" ]]; then
-    { echo "SMART Health Summary"; echo "Status: SMART unavailable (USB bridge limitation or not detected)."; } > "$SMART_SUMMARY_TXT"; return
-  }
+    { echo "SMART Health Summary"; echo "Status: SMART unavailable (USB bridge limitation or not detected)."; } > "$SMART_SUMMARY_TXT"
+    return
+  fi
   local HEALTH POH PWR_CYC REALLOC PENDING UNCORR CRC TEMP ERRLOG SELFTEST
   HEALTH="$(
     awk -F': ' '

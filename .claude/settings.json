@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(lsblk:*)",
+      "Bash(blkid:*)",
+      "Bash(udevadm info:*)",
+      "Bash(file:*)",
+      "Bash(file -s:*)",
+      "Bash(parted -m -s:*)",
+      "Bash(parted -s:*)",
+      "Bash(findmnt:*)",
+      "Bash(mountpoint:*)",
+      "Bash(lsusb:*)",
+      "Bash(lsscsi:*)",
+      "Bash(smartctl --scan*)",
+      "Bash(smartctl -i:*)",
+      "Bash(ddrescuelog -t:*)",
+      "Bash(isoinfo -d:*)",
+      "Bash(shellcheck:*)",
+      "Bash(bash -n:*)",
+      "Bash(chmod +x scripts/*.sh)",
+      "Bash(ls:*)",
+      "Bash(stat:*)",
+      "Bash(df -h:*)",
+      "Bash(du -sh:*)",
+      "Bash(grep:*)",
+      "Bash(awk:*)",
+      "Bash(sed:*)"
+    ],
+    "ask": [
+      "Bash(sudo:*)",
+      "Bash(mount:*)",
+      "Bash(umount:*)",
+      "Bash(ddrescue:*)",
+      "Bash(dd:*)",
+      "Bash(wipefs:*)",
+      "Bash(nwipe:*)",
+      "Bash(badblocks:*)",
+      "Bash(rsync:*)",
+      "Bash(apt:*)"
+    ],
+    "deny": [
+      "Bash(rm -rf /*)",
+      "Bash(:(){ :|:& };:)"
+    ]
+  }
+}

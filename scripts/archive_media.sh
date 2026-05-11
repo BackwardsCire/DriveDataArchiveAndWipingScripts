@@ -1,0 +1,567 @@
+#! /usr/bin/env bash
+# archive_media.sh — interactive archiver for Zip/CD/DVD/legacy HDD to NAS.
+#
+# Workflow:
+#   1. Load config/archive.conf (copy from .example if not present).
+#   2. Verify NAS destination is mounted/reachable.
+#   3. Detect candidate source media via detect_media.sh; let operator pick
+#      (or accept device path on the command line).
+#   4. ddrescue in stages: fast → retry → optional deep-scrape.
+#   5. Optional fallback tools (dvdisaster, safecopy) if bad sectors remain.
+#   6. Mount the image read-only and rsync the contents to the NAS.
+#   7. Write a per-case report locally and into the NAS case directory.
+#
+# Run under tmux. Run with sudo (ddrescue + mount need it).
+#
+# Env toggles:
+#   DRY_RUN=1        Skip every destructive/expensive command but exercise the flow.
+#   AUTO=1           No interactive prompts; use defaults from config (best-effort).
+#   CONFIG=/path     Override config file path.
+
+set -Eeuo pipefail
+umask 077
+
+# Block devices and mount(8) need root. Bail early with a clear message rather
+# than failing deep in ddrescue. disktools.sh's `need_root` already covers the
+# menu path; this catches direct invocation of the script.
+if [[ $EUID -ne 0 ]]; then
+  echo "Error: run as root (sudo $0 [device])" >&2
+  exit 1
+fi
+
+# ---------- paths & config -------------------------------------------------
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+PROJ_DIR="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
+
+OWNER="${SUDO_USER:-$USER}"
+OWNER_HOME="$(getent passwd "${OWNER}" | cut -d: -f6)"
+[[ -z "$OWNER_HOME" ]] && OWNER_HOME="$(eval echo "~${OWNER}")"
+
+CONFIG_FILE="${CONFIG:-${PROJ_DIR}/config/archive.conf}"
+CONFIG_EXAMPLE="${PROJ_DIR}/config/archive.conf.example"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "No config at: $CONFIG_FILE"
+  echo "Copy ${CONFIG_EXAMPLE} to ${CONFIG_FILE}, fill in your NAS details, and rerun."
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+# Validate that the config didn't leave us with empty/unset paths. mkdir -p ""
+# silently no-ops, which would later look like a permission error. Done before
+# the tilde-expansion below so a config that simply omits a key reports a
+# friendly error rather than a `set -u` unbound-variable trace.
+for v in NAS_DEST SCRATCH_DIR REPORT_ROOT NAS_TRANSPORT; do
+  if [[ -z "${!v:-}" ]]; then
+    echo "Config error: $v is empty or unset in $CONFIG_FILE" >&2
+    exit 1
+  fi
+done
+
+# expand ~/ in config-supplied paths
+SCRATCH_DIR="${SCRATCH_DIR/#\~/$OWNER_HOME}"
+REPORT_ROOT="${REPORT_ROOT/#\~/$OWNER_HOME}"
+
+DRY_RUN="${DRY_RUN:-0}"
+AUTO="${AUTO:-0}"
+
+TS="$(date -u +'%Y%m%dT%H%M%SZ')"
+SESSION_LOG="${REPORT_ROOT}/archive_${TS}.log"
+
+mkdir -p "$REPORT_ROOT" "$SCRATCH_DIR"
+chown -R "${OWNER}:${OWNER}" "$REPORT_ROOT" "$SCRATCH_DIR" 2>/dev/null || true
+
+exec > >(tee -a "$SESSION_LOG") 2>&1
+
+# ---------- helpers --------------------------------------------------------
+log()    { printf '==> %s\n' "$*"; }
+warn()   { printf '!! %s\n' "$*" >&2; }
+fatal()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
+phase()  { printf '\n===== %s :: %s =====\n' "$(date -u +'%FT%TZ')" "$*"; }
+pause()  { [[ "$AUTO" == "1" ]] && return 0; read -rp "==> $* (Enter to continue, Ctrl-C to abort) "; }
+confirm() {
+  local msg="$1" default="${2:-N}" reply
+  if [[ "$AUTO" == "1" ]]; then [[ "$default" =~ ^[Yy]$ ]]; return; fi
+  read -rp "==> ${msg} [y/N]: " reply || true
+  reply="${reply:-$default}"
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+require() { command -v "$1" >/dev/null 2>&1 || fatal "Missing tool: $1 (install per INSTALL.md)"; }
+fix_owner() { chown -R "${OWNER}:${OWNER}" "$1" 2>/dev/null || true; }
+
+require ddrescue
+require ddrescuelog
+require timeout
+require lsblk
+require parted
+require findmnt
+require rsync
+require file
+require mount
+require umount
+
+# Optional tools — checked before use, not at startup.
+have() { command -v "$1" >/dev/null 2>&1; }
+require_config() {
+  local v="$1"
+  [[ -n "${!v:-}" ]] || fatal "Config error: $v is required when NAS_TRANSPORT=${NAS_TRANSPORT}."
+}
+
+# ---------- NAS reachability ----------------------------------------------
+ensure_nas_mounted() {
+  case "${NAS_TRANSPORT:-none}" in
+    none)
+      log "NAS_TRANSPORT=none — using local path: $NAS_DEST"
+      mkdir -p "$NAS_DEST"
+      ;;
+    mounted)
+      local parent
+      parent="$(findmnt -no TARGET --target "$NAS_DEST" 2>/dev/null || true)"
+      [[ -z "$parent" ]] && fatal "NAS_DEST ($NAS_DEST) is not under any mounted filesystem. Mount it first or set NAS_TRANSPORT to cifs/nfs."
+      log "NAS already mounted at: $parent"
+      mkdir -p "$NAS_DEST"
+      ;;
+    cifs)
+      require_config NAS_CIFS_SHARE
+      require_config NAS_CIFS_MOUNTPOINT
+      require_config NAS_CIFS_CREDENTIALS
+      require_config NAS_CIFS_OPTS
+      have mount.cifs || fatal "Missing mount.cifs (install cifs-utils)."
+      [[ -r "$NAS_CIFS_CREDENTIALS" ]] || fatal "CIFS credentials file is not readable: $NAS_CIFS_CREDENTIALS"
+      mkdir -p "$NAS_CIFS_MOUNTPOINT"
+      if mountpoint -q "$NAS_CIFS_MOUNTPOINT"; then
+        log "CIFS already mounted at $NAS_CIFS_MOUNTPOINT"
+      else
+        log "Mounting CIFS share $NAS_CIFS_SHARE -> $NAS_CIFS_MOUNTPOINT"
+        mount -t cifs "$NAS_CIFS_SHARE" "$NAS_CIFS_MOUNTPOINT" \
+          -o "credentials=${NAS_CIFS_CREDENTIALS},${NAS_CIFS_OPTS}"
+      fi
+      mkdir -p "$NAS_DEST"
+      ;;
+    nfs)
+      require_config NAS_NFS_EXPORT
+      require_config NAS_NFS_MOUNTPOINT
+      require_config NAS_NFS_OPTS
+      have mount.nfs || fatal "Missing mount.nfs (install nfs-common)."
+      mkdir -p "$NAS_NFS_MOUNTPOINT"
+      if mountpoint -q "$NAS_NFS_MOUNTPOINT"; then
+        log "NFS already mounted at $NAS_NFS_MOUNTPOINT"
+      else
+        log "Mounting NFS export $NAS_NFS_EXPORT -> $NAS_NFS_MOUNTPOINT"
+        mount -t nfs "$NAS_NFS_EXPORT" "$NAS_NFS_MOUNTPOINT" -o "$NAS_NFS_OPTS"
+      fi
+      mkdir -p "$NAS_DEST"
+      ;;
+    *) fatal "Unknown NAS_TRANSPORT: $NAS_TRANSPORT" ;;
+  esac
+  # Writability probe
+  local probe="${NAS_DEST}/.archive_write_test_${TS}"
+  : > "$probe" 2>/dev/null || fatal "NAS destination ${NAS_DEST} is not writable."
+  rm -f "$probe"
+}
+
+# ---------- pick a device --------------------------------------------------
+pick_device() {
+  local supplied="${1:-}"
+  if [[ -n "$supplied" ]]; then
+    [[ -b "$supplied" ]] || fatal "Not a block device: $supplied"
+    SRC="$supplied"
+    return
+  fi
+  log "Scanning for source media..."
+  bash "${SCRIPT_DIR}/detect_media.sh"
+  echo
+  if [[ "$AUTO" == "1" ]]; then
+    fatal "AUTO=1 with no device specified — pass a device path on the command line."
+  fi
+  read -rp "Enter the SOURCE device path (e.g. /dev/sr0, /dev/sdc): " SRC
+  [[ -b "$SRC" ]] || fatal "Not a block device: $SRC"
+}
+
+# ---------- safety ---------------------------------------------------------
+guard_device() {
+  local dev="$1"
+  local root_src parent target
+  root_src="$(findmnt -no SOURCE / 2>/dev/null || true)"
+  parent="$(lsblk -no PKNAME "$root_src" 2>/dev/null | head -n1 || true)"
+  target="$(basename "$dev")"
+  [[ "$target" == "$parent" ]] && fatal "$dev is the SYSTEM DISK. Refusing."
+  if lsblk -ln -o NAME,MOUNTPOINT "$dev" 2>/dev/null | awk '$2!=""{exit 0} END{exit 1}'; then
+    warn "$dev or a partition is currently mounted:"
+    lsblk -ln -o NAME,MOUNTPOINT "$dev" | awk '$2!=""{print "  /dev/"$1" -> "$2}'
+    confirm "Unmount it now?" Y || fatal "Aborted by user."
+    while read -r p; do umount -v "/dev/$p" || true; done < <(lsblk -ln -o NAME,MOUNTPOINT "$dev" | awk '$2!=""{print $1}')
+  fi
+}
+
+# ---------- imaging --------------------------------------------------------
+# Globals set by image_source: IMAGE, MAPFILE, BSARG, MTYPE, BAD_BYTES, IMAGING_RC, DEEP_RC
+run_ddrescue() {
+  local timeout_value="${DDRESCUE_PASS_TIMEOUT:-}"
+  if [[ -n "$timeout_value" && "$timeout_value" != "0" ]]; then
+    log "Watchdog: timeout --foreground --kill-after=60s ${timeout_value} ddrescue $*"
+    timeout --foreground --kill-after=60s "$timeout_value" ddrescue "$@"
+  else
+    ddrescue "$@"
+  fi
+}
+
+image_source() {
+  local dev="$1" mtype="$2" base="$3"
+  IMAGE="${SCRATCH_DIR}/${base}.img"
+  MAPFILE="${IMAGE}.map"
+
+  local bs_args=()
+  case "$mtype" in
+    cd|dvd|optical) BSARG="-b 2048"; bs_args=(-b 2048) ;;
+    *)              BSARG="" ;;
+  esac
+
+  phase "ddrescue fast pass"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "DRY RUN: would run: ddrescue ${bs_args[*]} -f -n '$dev' '$IMAGE' '$MAPFILE'"
+    : > "$IMAGE"; : > "$MAPFILE"
+    IMAGING_RC=0
+  else
+    set +e
+    run_ddrescue "${bs_args[@]}" -f -n "$dev" "$IMAGE" "$MAPFILE"
+    IMAGING_RC=$?
+    set -e
+  fi
+  log "Fast pass exit=$IMAGING_RC"
+  if [[ "$IMAGING_RC" == "124" || "$IMAGING_RC" == "137" ]]; then
+    warn "Fast pass hit DDRESCUE_PASS_TIMEOUT=${DDRESCUE_PASS_TIMEOUT}; continuing with the mapfile state recovered so far."
+  fi
+
+  phase "ddrescue retry pass (-d -r${RETRIES:-4})"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "DRY RUN: would run retry pass"
+  else
+    set +e
+    run_ddrescue "${bs_args[@]}" -d -r"${RETRIES:-4}" "$dev" "$IMAGE" "$MAPFILE"
+    IMAGING_RC=$?
+    set -e
+  fi
+  log "Retry pass exit=$IMAGING_RC"
+  if [[ "$IMAGING_RC" == "124" || "$IMAGING_RC" == "137" ]]; then
+    warn "Retry pass hit DDRESCUE_PASS_TIMEOUT=${DDRESCUE_PASS_TIMEOUT}; continuing with the mapfile state recovered so far."
+  fi
+
+  # After both passes, the image must exist and have nonzero size. If
+  # ddrescue exited with a CLI / device-open error we'd otherwise sail
+  # right into the mount step with an empty file and produce a confusing
+  # message there. Bail early instead.
+  if [[ "$DRY_RUN" != "1" ]]; then
+    if [[ ! -s "$IMAGE" ]]; then
+      fatal "ddrescue produced an empty image at $IMAGE — check the session log for the actual error before retrying."
+    fi
+  fi
+
+  # Bad-sector summary from the mapfile
+  BAD_BYTES=0
+  if [[ -s "$MAPFILE" ]] && have ddrescuelog; then
+    BAD_BYTES="$(ddrescuelog -t "$MAPFILE" 2>/dev/null \
+                 | awk '/bad-sector:/ {gsub(/[^0-9]/,"",$2); print $2; exit}')"
+    BAD_BYTES="${BAD_BYTES:-0}"
+  fi
+  log "Mapfile reports ${BAD_BYTES} bad bytes"
+
+  DEEP_RC=0
+  if (( BAD_BYTES > 0 )); then
+    if [[ -n "${AUTO_DEEP_SCRAPE:-}" ]] || confirm "Run deep-scrape (reverse, -r${DEEP_RETRIES:-16})?" Y; then
+      phase "ddrescue deep-scrape (-d -R -r${DEEP_RETRIES:-16})"
+      if [[ "$DRY_RUN" == "1" ]]; then
+        log "DRY RUN: would run deep-scrape"
+      else
+        set +e
+        run_ddrescue "${bs_args[@]}" -d -R -r"${DEEP_RETRIES:-16}" "$dev" "$IMAGE" "$MAPFILE"
+        DEEP_RC=$?
+        set -e
+      fi
+      log "Deep-scrape exit=$DEEP_RC"
+      if [[ "$DEEP_RC" == "124" || "$DEEP_RC" == "137" ]]; then
+        warn "Deep-scrape hit DDRESCUE_PASS_TIMEOUT=${DDRESCUE_PASS_TIMEOUT}; keeping the mapfile so the run can be resumed later."
+      fi
+      if [[ -s "$MAPFILE" ]] && have ddrescuelog; then
+        BAD_BYTES="$(ddrescuelog -t "$MAPFILE" 2>/dev/null \
+                     | awk '/bad-sector:/ {gsub(/[^0-9]/,"",$2); print $2; exit}')"
+        BAD_BYTES="${BAD_BYTES:-0}"
+      fi
+      log "Post-deep-scrape bad bytes: ${BAD_BYTES}"
+    fi
+  fi
+}
+
+# ---------- fallback tools -------------------------------------------------
+# Each fallback writes a SEPARATE artifact next to the primary image. We do
+# NOT auto-merge into the ddrescue mapfile — dvdisaster and safecopy both
+# zero-fill unreadable sectors in their output, so blindly folding their
+# images back via ddrescue would overwrite *good* data with zeros. The
+# operator inspects the artifacts after the run and decides what to keep.
+# FALLBACK_ARTIFACTS is the list of paths to mention in the final report.
+FALLBACK_ARTIFACTS=()
+run_fallbacks() {
+  local dev="$1" mtype="$2"
+  (( BAD_BYTES > 0 )) || { log "No bad sectors remain; skipping fallback tools."; return; }
+  [[ -z "${FALLBACK_TOOLS:-}" ]] && { log "No FALLBACK_TOOLS configured."; return; }
+
+  IFS=',' read -r -a tools <<<"$FALLBACK_TOOLS"
+  for tool in "${tools[@]}"; do
+    tool="${tool// /}"
+    [[ -z "$tool" ]] && continue
+    case "$tool" in
+      dvdisaster)
+        if [[ "$mtype" != "cd" && "$mtype" != "dvd" && "$mtype" != "optical" ]]; then
+          log "Skipping dvdisaster (non-optical media)"; continue
+        fi
+        if ! have dvdisaster; then warn "dvdisaster not installed; skipping"; continue; fi
+        local dvdi="${IMAGE}.dvdisaster.iso"
+        phase "Fallback: dvdisaster --read -> ${dvdi}"
+        if [[ "$DRY_RUN" == "1" ]]; then
+          log "DRY RUN: would run dvdisaster"
+        else
+          # Minimal portable invocation — older dvdisaster versions don't
+          # all accept --read-attempts. Each read retries internally.
+          set +e
+          dvdisaster -d "$dev" -i "$dvdi" --read || true
+          set -e
+          [[ -f "$dvdi" ]] && FALLBACK_ARTIFACTS+=("$dvdi")
+        fi
+        ;;
+      cdparanoia)
+        if [[ "$mtype" != "cd" ]]; then
+          log "Skipping cdparanoia (not a CD)"; continue
+        fi
+        if ! have cdparanoia; then warn "cdparanoia not installed; skipping"; continue; fi
+        local audio_dir="${SCRATCH_DIR}/$(basename "${IMAGE%.img}")-audio"
+        phase "Fallback: cdparanoia -> ${audio_dir}"
+        if [[ "$DRY_RUN" == "1" ]]; then
+          log "DRY RUN: would run cdparanoia"
+        else
+          mkdir -p "$audio_dir"
+          ( cd "$audio_dir" && cdparanoia -B -d "$dev" || true )
+          [[ -n "$(ls -A "$audio_dir" 2>/dev/null)" ]] && FALLBACK_ARTIFACTS+=("$audio_dir")
+        fi
+        ;;
+      safecopy)
+        if ! have safecopy; then warn "safecopy not installed; skipping"; continue; fi
+        local sc="${IMAGE}.safecopy.img"
+        local sc_bad="${IMAGE}.safecopy.bad"
+        phase "Fallback: safecopy (3 stages) -> ${sc}"
+        if [[ "$DRY_RUN" == "1" ]]; then
+          log "DRY RUN: would run safecopy stages"
+        else
+          set +e
+          # safecopy syntax: safecopy [opts] SRC DEST ; -B writes the bad-block list
+          safecopy --stage1 -B "$sc_bad" "$dev" "$sc" 2>&1 || true
+          safecopy --stage2 -B "$sc_bad" "$dev" "$sc" 2>&1 || true
+          safecopy --stage3 -B "$sc_bad" "$dev" "$sc" 2>&1 || true
+          set -e
+          [[ -f "$sc" ]] && FALLBACK_ARTIFACTS+=("$sc")
+          [[ -f "$sc_bad" ]] && FALLBACK_ARTIFACTS+=("$sc_bad")
+        fi
+        ;;
+      *) warn "Unknown fallback tool: $tool" ;;
+    esac
+  done
+
+  if (( ${#FALLBACK_ARTIFACTS[@]} > 0 )); then
+    log "Fallback artifacts produced (kept separate from the ddrescue image):"
+    printf '   - %s\n' "${FALLBACK_ARTIFACTS[@]}"
+    log "Compare these against the ddrescue image manually; see docs/recovery_strategies.md."
+  fi
+}
+
+# ---------- mount image and copy to NAS ------------------------------------
+# parted's "fs-name" column uses names that aren't always valid mount -t
+# values. Map known divergences.
+parted_to_mount_fstype() {
+  case "$1" in
+    fat16|fat32) echo "vfat" ;;
+    ntfs)        echo "ntfs-3g" ;;  # mount -t ntfs is read-only on most kernels
+    linux-swap*) echo "" ;;          # skip
+    *)           echo "$1" ;;
+  esac
+}
+
+# Explicit cleanup helper rather than a RETURN trap. RETURN traps in bash
+# fire on every subsequent function return for the rest of the script,
+# which would unmount the wrong thing later.
+_cleanup_mount() {
+  local mnt="$1"
+  [[ -z "$mnt" ]] && return 0
+  umount "$mnt" 2>/dev/null || true
+  rmdir "$mnt" 2>/dev/null || true
+}
+
+copy_to_nas() {
+  local image="$1" case_dir="$2"
+  local mnt rc=0
+  mnt="$(mktemp -d -t archive-mnt-XXXX)"
+
+  local fs_desc
+  fs_desc="$(file -b "$image" 2>/dev/null || echo unknown)"
+  log "Image FS guess: $fs_desc"
+
+  local mounted=0
+  for fstype in iso9660 udf vfat ntfs-3g hfsplus hfs ext4 ext3 ext2; do
+    if mount -o loop,ro -t "$fstype" "$image" "$mnt" 2>/dev/null; then
+      log "Mounted $image as $fstype"
+      mounted=1; break
+    fi
+  done
+
+  if (( mounted == 0 )); then
+    # Probe the partition table for the first usable partition. parted -m
+    # uses ':' as field separator: NUMBER:START:END:SIZE:FS:NAME:FLAGS
+    local p_line off raw_fs fstype
+    p_line="$(parted -m -s "$image" unit B print 2>/dev/null \
+              | awk -F: 'NR>2 && $5!="" && $5!="free" {print; exit}')"
+    if [[ -n "$p_line" ]]; then
+      off="$(awk -F: '{sub(/B$/,"",$2); print $2}' <<<"$p_line")"
+      raw_fs="$(awk -F: '{print $5}' <<<"$p_line")"
+      fstype="$(parted_to_mount_fstype "$raw_fs")"
+      if [[ -n "$fstype" && -n "$off" ]]; then
+        log "Trying partition at offset ${off} (parted said '$raw_fs' → mount -t '$fstype')"
+        mount -o "loop,ro,offset=${off}" -t "$fstype" "$image" "$mnt" 2>/dev/null && mounted=1
+      else
+        warn "Found partition at offset ${off:-?} with fs '${raw_fs:-?}' but no mount-friendly type — skipping."
+      fi
+    fi
+  fi
+
+  if (( mounted == 0 )); then
+    warn "Could not mount image; copying raw image only."
+    cp -av "$image" "$case_dir/" || true
+    fix_owner "$case_dir"
+    _cleanup_mount "$mnt"
+    return 1
+  fi
+
+  log "rsync $mnt/ -> $case_dir/"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "DRY RUN: would rsync"
+  else
+    rsync -aHAX --info=progress2 "$mnt/" "$case_dir/" || { warn "rsync reported issues (encoding, sparse files); see log."; rc=1; }
+  fi
+  fix_owner "$case_dir"
+  _cleanup_mount "$mnt"
+  return $rc
+}
+
+# ---------- report ---------------------------------------------------------
+write_report() {
+  local case_dir="$1" report="$2"
+  {
+    echo "===== ARCHIVE CASE REPORT ====="
+    echo "Timestamp (UTC): $TS"
+    echo "Source device:   ${SRC}"
+    echo "Media type:      ${MTYPE}"
+    echo "Case name:       ${NAME}"
+    echo "Image:           ${IMAGE}"
+    echo "Mapfile:         ${MAPFILE}"
+    echo "NAS destination: ${case_dir}"
+    echo
+    echo "---- Imaging ----"
+    echo "ddrescue pass timeout: ${DDRESCUE_PASS_TIMEOUT:-disabled}"
+    echo "ddrescue retry rc: ${IMAGING_RC:-?}"
+    echo "ddrescue deep-scrape rc: ${DEEP_RC:-skipped}"
+    echo "Bad bytes remaining: ${BAD_BYTES:-?}"
+    echo
+    echo "---- Mapfile summary ----"
+    if [[ -s "$MAPFILE" ]] && have ddrescuelog; then
+      ddrescuelog -t "$MAPFILE" || true
+    else
+      echo "(no mapfile)"
+    fi
+    echo
+    if (( ${#FALLBACK_ARTIFACTS[@]} > 0 )); then
+      echo "---- Fallback artifacts (kept separate; do not merge blindly) ----"
+      printf '  %s\n' "${FALLBACK_ARTIFACTS[@]}"
+      echo
+    fi
+    echo "---- Destination listing ----"
+    ls -la "$case_dir" 2>/dev/null | head -50
+    echo
+    echo "Session log: $SESSION_LOG"
+  } >"$report"
+  fix_owner "$report"
+}
+
+# ---------- main -----------------------------------------------------------
+log "archive_media.sh starting"
+log "Config:        $CONFIG_FILE"
+log "Session log:   $SESSION_LOG"
+log "Scratch dir:   $SCRATCH_DIR"
+log "NAS dest:      $NAS_DEST"
+log "DRY_RUN=$DRY_RUN AUTO=$AUTO"
+
+ensure_nas_mounted
+pick_device "${1:-}"
+guard_device "$SRC"
+
+# Default media type from detect_media.sh
+DEFAULT_MTYPE="$(bash "${SCRIPT_DIR}/detect_media.sh" --tsv | awk -F'\t' -v d="$SRC" 'NR>1 && $1==d {print $2; exit}')"
+DEFAULT_MTYPE="${DEFAULT_MTYPE:-hdd}"
+case "$DEFAULT_MTYPE" in
+  optical) DEFAULT_MTYPE="cd" ;;
+esac
+
+if [[ "$AUTO" == "1" ]]; then
+  MTYPE="${MTYPE_OVERRIDE:-$DEFAULT_MTYPE}"
+  NAME="${NAME_OVERRIDE:-auto-${TS}}"
+else
+  read -rp "Media type [cd|dvd|zip|hdd] (default: ${DEFAULT_MTYPE}): " MTYPE
+  MTYPE="${MTYPE:-$DEFAULT_MTYPE}"
+  read -rp "Short case name (no spaces): " NAME
+  [[ -z "$NAME" ]] && fatal "Case name is required."
+fi
+
+case "$MTYPE" in cd|dvd|zip|hdd|optical) ;; *) fatal "Bad media type: $MTYPE" ;; esac
+[[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || fatal "Case name must match [A-Za-z0-9._-]"
+
+BASE="${MTYPE}-${NAME}-${TS}"
+CASE_DIR="${NAS_DEST}/${BASE}"
+mkdir -p "$CASE_DIR"
+fix_owner "$CASE_DIR"
+
+phase "Plan"
+echo "Source:      $SRC"
+echo "Media type:  $MTYPE"
+echo "Case base:   $BASE"
+echo "Image (loc): ${SCRATCH_DIR}/${BASE}.img"
+echo "Dest (NAS):  $CASE_DIR"
+pause "Plan looks right?"
+
+image_source "$SRC" "$MTYPE" "$BASE"
+run_fallbacks "$SRC" "$MTYPE"
+
+phase "Mount image and copy to NAS"
+copy_to_nas "$IMAGE" "$CASE_DIR" || warn "Copy step had issues."
+
+REPORT="${CASE_DIR}/report.txt"
+write_report "$CASE_DIR" "$REPORT"
+log "Report: $REPORT"
+cp -f "$REPORT" "${REPORT_ROOT}/${BASE}-report.txt" || true
+fix_owner "${REPORT_ROOT}"
+
+phase "Cleanup"
+if confirm "Delete local image and mapfile (${IMAGE} / ${MAPFILE})?" N; then
+  rm -f -- "$IMAGE" "$MAPFILE" 2>/dev/null || true
+  log "Local scratch image+mapfile cleaned."
+  if (( ${#FALLBACK_ARTIFACTS[@]} > 0 )); then
+    log "Fallback artifacts left in place (separate files; inspect manually):"
+    printf '   - %s\n' "${FALLBACK_ARTIFACTS[@]}"
+  fi
+else
+  log "Kept image at ${IMAGE} (mapfile ${MAPFILE})."
+fi
+
+if [[ "$MTYPE" == "cd" || "$MTYPE" == "dvd" || "$MTYPE" == "optical" ]]; then
+  if have eject && [[ "$DRY_RUN" != "1" ]]; then
+    eject "$SRC" 2>/dev/null || true
+  fi
+fi
+
+log "Done. Case at: $CASE_DIR"

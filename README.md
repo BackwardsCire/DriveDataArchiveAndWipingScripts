@@ -1,125 +1,170 @@
-# Disk Tools - Drive Wipe and Data Rescue (Ubuntu 25.04+)
+# DriveDataArchiveAndWipingScripts (Ubuntu 25.04+)
 
-Two operator-focused Bash utilities for securely wiping drives for resale and safely rescuing data from failing media. Both scripts are designed for unattended runs inside `tmux` with clear logging and PDF-ready outputs.
+Two related Bash workflows for working with old/legacy storage on a Linux box:
+
+1. **Archive aging media to a NAS** — auto-detect Zip disks, optical drives, and legacy hard drives; image with `ddrescue` using a multi-pass / multi-tool recovery strategy; mount the image and rsync recovered files to a NAS share.
+2. **Securely wipe drives for resale** — DoD-short wipe with `nwipe`, surface scan with `badblocks`, SMART capture, and a buyer-friendly PDF report.
+
+The two workflows share helpers (logging conventions, sudo-aware home-directory handling) but are otherwise independent — you can use either without the other.
+
+No NAS is required if you do not want one: write archives to a local path and use the included Samba setup helper to publish that path as a LAN SMB/CIFS share.
 
 ---
 
 ## What's Included
 
-- **wipedriveforsale.sh** - Securely wipes drives (DoD short with verify), clears filesystem signatures, runs a read-only surface scan, gathers SMART data, and produces buyer/audit-friendly reports.
-- **interactive_data_rescue.sh** - Guides you through imaging and recovering data from damaged or legacy drives using `ddrescue`, read-only mounts, and optional file copy via `rsync`.
+### Archive workflow
+- **`scripts/detect_media.sh`** — enumerates source candidates (Zip / optical / USB / IDE) with kind classification, even when no medium is inserted. `--tsv` and `--json` output for scripting.
+- **`scripts/archive_media.sh`** — interactive orchestrator. Reads `config/archive.conf`, ensures the NAS is mounted, picks (or accepts) a device, runs ddrescue in stages with optional fallback tools (`dvdisaster`, `cdparanoia`, `safecopy`), mounts the image read-only, and rsyncs to the NAS.
+- **`scripts/setup_local_samba_share.sh`** — optional helper for the no-NAS case. Installs/configures Samba so the local archive directory is shared over SMB/CIFS.
+- **`config/archive.conf.example`** — template for NAS destination, mount type (CIFS/NFS/already-mounted/local), retry counts, fallback chain.
+
+### Wipe workflow (unchanged from earlier releases)
+- **`scripts/wipedriveforsale.sh`** — wipe + verify + report.
+- **`scripts/interactive_data_rescue.sh`** — older single-device rescue helper, kept for cases the new orchestrator doesn't handle (custom HFS partition layouts, etc.).
 
 ---
 
-## Requirements
+## Where to look
 
-Built and tested on **Ubuntu 25.04+**.
-
-**Core (wipe + rescue)**
-```bash
-sudo apt update
-sudo apt install -y smartmontools e2fsprogs nwipe enscript ghostscript nvme-cli \
-  util-linux usbutils coreutils tmux gdisk parted gawk sed grep
-```
-
-**Optional (rescue / imaging)**
-```bash
-sudo apt install -y gddrescue pv ntfs-3g exfatprogs hfsprogs hfsutils zip unzip
-```
-
----
-
-## Install
-
-```bash
-git clone https://github.com/your-org/disk-tools.git disk-tools
-cd disk-tools
-chmod +x scripts/*.sh
-```
-
----
+- **First time using this?** Read [docs/USAGE.md](docs/USAGE.md) — practical step-by-step walkthroughs for archiving Zip disks, CDs/DVDs, and old hard drives, plus the wipe workflow and what to do when ddrescue leaves bad sectors.
+- **Installing?** [INSTALL.md](INSTALL.md).
+- **NAS configuration?** [docs/nas_setup.md](docs/nas_setup.md).
+- **Curious about the multi-pass recovery logic?** [docs/recovery_strategies.md](docs/recovery_strategies.md).
 
 ## Quick Start
 
-### Find the right drive
-List devices and note the path (e.g., `/dev/sdb`) before running either script:
+A single entry point — [disktools.sh](disktools.sh) — drives the daily workflows plus one-time local share setup:
+
 ```bash
-lsblk -o NAME,TRAN,SIZE,MODEL,SERIAL,MOUNTPOINT
+./disktools.sh             # interactive menu
+./disktools.sh detect      # read-only scan (no sudo needed)
+sudo ./disktools.sh archive [/dev/sdX]
+sudo AUTO=1 MTYPE_OVERRIDE=cd NAME_OVERRIDE=test-cd-01 ./disktools.sh archive /dev/sr0
+sudo ./disktools.sh wipe /dev/sdX
+sudo ./disktools.sh rescue
+./disktools.sh status      # recent ~/drive_reports entries
+sudo ./disktools.sh setup-share  # optional: local SMB/CIFS share when you do not use a NAS
+./disktools.sh dest local /srv/legacy-media
 ```
-- External/USB drives usually appear as `sd?` with `removable`/`usb` in the `TRAN` column.
-- Never target your OS disk (often `sda` or with mounted partitions in `MOUNTPOINT`).
 
-### Wipe a drive for resale
+The menu picks once per run, then execs into the chosen script. For long imaging or wipe runs, start inside tmux:
+
 ```bash
-sudo tmux new -s wipe
-sudo ./scripts/wipedriveforsale.sh /dev/sdX   # example: /dev/sdb
+sudo tmux new -s disktools './disktools.sh'
 ```
-- Step through phases: `sudo PAUSE=1 ./scripts/wipedriveforsale.sh /dev/sdX`
 
-### Rescue data from a failing drive
+### First-time archive setup
+
 ```bash
-sudo tmux new -s rescue
-sudo ./scripts/interactive_data_rescue.sh
+# 1. install dependencies (see INSTALL.md for the full list)
+sudo apt update && sudo apt install -y gddrescue parted rsync \
+  hfsprogs hfsutils dvdisaster safecopy cdparanoia file util-linux genisoimage tmux
+
+# 2. configure your NAS destination
+cp config/archive.conf.example config/archive.conf
+$EDITOR config/archive.conf
+
+# 3. confirm what's hooked up, then start the menu
+./disktools.sh detect
+sudo tmux new -s disktools './disktools.sh'
 ```
-- The script prompts for source device, media type, and case name.
 
-### Working inside tmux
+If you want local sharing instead of a NAS:
+
+```bash
+sudo ./disktools.sh setup-share
+# then in config/archive.conf:
+# NAS_TRANSPORT="none"
+# NAS_DEST="/srv/legacy-media"
 ```
-Ctrl+b then d   # detach
-tmux ls         # list sessions
-tmux attach -t wipe   # reattach
+
+### Wipe workflow
+
+```bash
+sudo tmux new -s wipe 'sudo ./disktools.sh wipe /dev/sdX'   # USB-only by default
+```
+
+See [docs/wipe_drive.md](docs/wipe_drive.md) for the full wipe walkthrough.
+
+---
+
+## Workflow at a glance (archive)
+
+```
+detect_media.sh
+      │
+      ▼
+archive_media.sh /dev/X
+      │
+      ├─► verify NAS reachable (mount or check)
+      ├─► ddrescue fast pass            (-n)
+      ├─► ddrescue retry pass           (-d -r4)
+      ├─► [if bad sectors] deep-scrape  (-d -R -r16)
+      ├─► [optional] dvdisaster / cdparanoia / safecopy fallbacks
+      ├─► mount image read-only, rsync → NAS case directory
+      └─► write report.txt locally + on NAS
+```
+
+Each step is gated and can be skipped via `DRY_RUN=1`. See [docs/recovery_strategies.md](docs/recovery_strategies.md) for the why behind each stage.
+
+---
+
+## Repository layout
+
+```
+.
+├── disktools.sh                    # top-level dispatcher + interactive menu
+├── CLAUDE.md                       # project context for Claude Code
+├── README.md
+├── INSTALL.md
+├── CHANGELOG.md
+├── CONTRIBUTING.md
+├── SECURITY.md
+├── LICENSE
+├── .claude/
+│   ├── settings.json
+│   └── commands/                   # /detect, /archive, /status
+├── config/
+│   └── archive.conf.example
+├── docs/
+│   ├── USAGE.md                    # **step-by-step walkthroughs — start here**
+│   ├── data_rescue.md              # original interactive_data_rescue guide
+│   ├── wipe_drive.md
+│   ├── media_detection.md          # detect_media.sh
+│   ├── nas_setup.md                # NAS transports & fstab patterns
+│   └── recovery_strategies.md      # multi-pass / multi-tool reasoning
+└── scripts/
+    ├── detect_media.sh
+    ├── archive_media.sh
+    ├── setup_local_samba_share.sh
+    ├── interactive_data_rescue.sh
+    └── wipedriveforsale.sh
 ```
 
 ---
 
-## Outputs and Logging
+## Outputs
 
-- All artifacts go to `~/drive_reports/` under the invoking user's home (even when run with sudo). No usernames need to be hardcoded.
-- **Wipe reports:** Text + PDF summaries, SMART raw and summary logs, `nwipe` transcript, `badblocks` output, and the session log. Runs are auto-sorted into `SUCCESS/` or `FAILED/`.
-- **Rescue sessions:** Imaging logs, ddrescue map/log, recovery notes, and command transcript saved to `~/drive_reports/rescue_<timestamp>.log`.
+All artifacts go under `~/drive_reports/` of the invoking user (sudo-safe). A copy of the per-case report also lands in the NAS case directory so the report travels with the data.
 
----
+Per archive case directory on the NAS: `<media-type>-<short-name>-<UTC-timestamp>/` with:
 
-## Safety Checks (wipe tool)
-
-- Refuses to run on the system disk or mounted partitions.
-- Defaults to USB/removable-only operation; set `ALLOW_NONUSB=1` to override.
-- Destructive steps require explicit confirmation unless `DRY_RUN=1`.
+- the recovered file tree,
+- `report.txt` (sources, ddrescue exit codes, bad-byte tally, mapfile summary, destination listing),
+- and — if the image couldn't be mounted — the raw `.img` itself.
 
 ---
 
-## Configuration Flags (wipe tool)
+## Safety
 
-| Variable | Purpose |
-|----------|---------|
-| `DEBUG=1` | Shell tracing into the session log. |
-| `PAUSE=1` | Pause between major phases. |
-| `DRY_RUN=1` | Simulate destructive actions for testing. |
-| `ALLOW_NONUSB=1` | Allow non-USB/non-removable targets (defaults to USB-only). |
-| `DRY_NWIPE_FAIL=1`, `DRY_BADBLOCKS_FAIL=1` | Simulate failures while in dry-run. |
-| `INCLUDE_NWIPE_TTY=1` | Embed `nwipe` progress output in reports. |
-
----
-
-## Troubleshooting
-
-- **Ghostscript/enscript missing:** Install `enscript` and `ghostscript`; PDF generation is skipped if absent.
-- **Badblocks "device busy":** Ensure all partitions on the target are unmounted (`sudo lsof /dev/sdX` can help).
-- **SMART unavailable over USB:** Some bridges mask SMART; the report will note when SMART cannot be read.
-- **Slow runs:** Use `tmux` and let the script finish; logs stream to `~/drive_reports/`.
-
----
-
-## Repository Layout
-
-- `scripts/wipedriveforsale.sh` - wipe + verify + report
-- `scripts/interactive_data_rescue.sh` - imaging and recovery helper
-- `docs/wipe_drive.md` - detailed wipe instructions
-- `docs/data_rescue.md` - detailed rescue workflow
-- `CHANGELOG.md`, `LICENSE`, `INSTALL.md`, `CONTRIBUTING.md`, `SECURITY.md`
+- Read-only on the source until imaging is complete; the image is the canonical source for everything downstream.
+- Refuses to touch the system disk; warns and prompts before unmounting partitions on the source.
+- `DRY_RUN=1` skips every destructive/expensive command but exercises the flow end-to-end.
+- Wipe tool defaults to USB-only operation; override only with `ALLOW_NONUSB=1`.
 
 ---
 
 ## License
 
-MIT License. See `LICENSE`.
+MIT. See [LICENSE](LICENSE).
