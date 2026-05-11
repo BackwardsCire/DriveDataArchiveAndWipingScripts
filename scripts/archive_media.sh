@@ -827,10 +827,10 @@ else
   MTYPE="${MTYPE:-$DEFAULT_MTYPE}"
   SUGGESTED_NAME="$(suggest_case_name "$SRC" "$MTYPE")"
   if [[ -n "$SUGGESTED_NAME" ]]; then
-    read -rp "Short case name (default: ${SUGGESTED_NAME}): " NAME
+    read -rp "Image name [detected: \"${SUGGESTED_NAME}\"]: " NAME
     NAME="${NAME:-$SUGGESTED_NAME}"
   else
-    read -rp "Short case name (no spaces): " NAME
+    read -rp "Image name (no spaces): " NAME
   fi
   [[ -z "$NAME" ]] && fatal "Case name is required."
 fi
