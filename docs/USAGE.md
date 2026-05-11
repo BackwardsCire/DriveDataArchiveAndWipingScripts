@@ -22,8 +22,8 @@ You need:
 
 - **An Ubuntu 25.04+ box** with the dependencies from [INSTALL.md](../INSTALL.md). The two key packages are `gddrescue` (provides `ddrescue` + `ddrescuelog`) and `rsync`.
 - **Sudo access** on that box. Imaging block devices, mounting loop devices, and running `nwipe` all need root.
-- **A reachable NAS** for the archive workflow. SMB/CIFS, NFS, or any path under an already-mounted filesystem works. See [docs/nas_setup.md](nas_setup.md).
-- **Local scratch space.** ddrescue writes the image to disk first, then rsyncs to the NAS. Plan on **2× the source size** under `SCRATCH_DIR` (image + mapfile + possible fallback-tool artifacts). A 700 MB CD is fine; a 250 MB Zip disk is trivial; a 1 TB old HDD needs serious local headroom.
+- **An archive destination.** Local sharing via `/srv/legacy-media` is the default; SMB/CIFS, NFS, or any path under an already-mounted filesystem also works. See [docs/nas_setup.md](nas_setup.md).
+- **Local scratch space.** ddrescue writes the image to disk first, then rsyncs to the archive destination. Plan on **2× the source size** under `SCRATCH_DIR` (image + mapfile + possible fallback-tool artifacts). A 700 MB CD is fine; a 250 MB Zip disk is trivial; a 1 TB old HDD needs serious local headroom.
 - **A USB enclosure or dock** for whatever you're plugging in. For Zip drives this is usually a USB Zip drive itself; for IDE hard drives, a USB-to-IDE/SATA adapter; for CDs/DVDs, a USB optical drive.
 - **`tmux`** if the imaging might take more than a few minutes. ddrescue on a flaky Zip can run for hours — you do not want a closed SSH session to take that with it.
 
@@ -31,7 +31,7 @@ Things to know:
 
 - Source media is read-only-as-far-as-possible until imaging finishes. Mount the *image*, not the original.
 - The scripts respect `SUDO_USER` so artifacts land under the invoking user's home, not root's, even when you run with `sudo`.
-- Everything destructive (wipes, the deep-scrape decision, deleting scratch images) is gated behind a y/N or "type the word" prompt.
+- Everything destructive is gated behind a y/N or "type the word" prompt. Archive deep-scrape is automatic by default (`AUTO_DEEP_SCRAPE=1`) because it only reads from the source.
 
 ---
 
@@ -58,7 +58,7 @@ sudo apt install -y nfs-common         # for NFS exports
 sudo apt install -y samba smbclient cifs-utils acl
 sudo ./disktools.sh setup-share
 
-# 3. Configure the NAS destination
+# 3. Configure the archive destination
 cp config/archive.conf.example config/archive.conf
 $EDITOR config/archive.conf
 # Set at minimum: NAS_DEST, NAS_TRANSPORT, and (for cifs/nfs) the
@@ -93,7 +93,7 @@ DRY_RUN skips ddrescue, mount, and rsync but exercises everything else (config l
 
 ### Low-interaction mode
 
-For batch-style archiving, pass the source device and set `AUTO=1`. The defaults come from `config/archive.conf`; `AUTO_DEEP_SCRAPE=1` runs deep-scrape automatically if bad sectors remain, and `DDRESCUE_PASS_TIMEOUT=3h` caps each ddrescue pass.
+For batch-style archiving, pass the source device and set `AUTO=1`. The defaults come from `config/archive.conf`; `AUTO_DEEP_SCRAPE=1` runs deep-scrape automatically if bad sectors remain, and `DDRESCUE_PASS_TIMEOUT=3h` caps each ddrescue pass. If `NAME_OVERRIDE` is omitted, the script uses a sanitized filesystem/ISO volume label when available.
 
 ```bash
 sudo AUTO=1 MTYPE_OVERRIDE=cd NAME_OVERRIDE=test-cd-01 ./disktools.sh archive /dev/sr0
@@ -119,7 +119,7 @@ The menu shows:
 
 ```
 1) Detect attached media          (read-only scan, no sudo needed)
-2) Archive media to NAS           (ddrescue + multi-pass + rsync)
+2) Archive media to storage       (ddrescue + multi-pass + rsync)
 3) Rescue from a specific device  (older interactive helper, HFS-aware)
 4) Wipe a drive for resale        (DESTRUCTIVE — irreversible)
 5) Show recent session reports
@@ -158,16 +158,16 @@ Zip 100/250 disks are the canonical "click of death" media. Image them while the
 
 4. **Answer the prompts.**
    - Media type: `zip` (default, since detect_media tagged it).
-   - Short case name: something like `wedding-photos-1998`. Letters, digits, `._-` only.
+   - Short case name: accept the suggested volume-label name if it looks right, or enter something like `wedding-photos-1998`. Letters, digits, `._-` only.
    - "Plan looks right?" — review, hit Enter.
 
 5. **Watch ddrescue do its thing.** You'll see two passes: fast (`-n`) then retry (`-d -r4`). On a healthy Zip, both finish in 5–15 minutes. On a flaky one, the retry pass can run for hours.
 
-6. **Deep-scrape prompt.** If the retry pass left bad sectors, you'll be asked whether to run a reverse-direction deep-scrape with high retries. **Say yes** unless you're in a hurry — it costs time, never data.
+6. **Deep-scrape.** If the retry pass left unresolved sectors, the default config runs a reverse-direction deep-scrape with high retries automatically. Set `AUTO_DEEP_SCRAPE=""` in `config/archive.conf` if you want a prompt instead.
 
 7. **Fallback tools (if still bad).** If `FALLBACK_TOOLS` is set in `archive.conf` and bad sectors remain after deep-scrape, the configured tools run (typically `safecopy` for Zip). These produce **separate** artifacts next to the main image — they do not overwrite it.
 
-8. **Mount + rsync.** The script auto-detects the filesystem (usually FAT on PC-formatted Zips, HFS on Mac-formatted) and rsyncs to `NAS_DEST/zip-<name>-<timestamp>/`.
+8. **Mount + rsync.** The script auto-detects the filesystem (usually FAT on PC-formatted Zips, HFS on Mac-formatted) and rsyncs to `NAS_DEST/zip-<name>-<timestamp>/` (`/srv/legacy-media/...` in local mode).
 
 9. **Report.** Look in `report.txt` inside the case directory. Verify the destination listing matches what you expected. If "bad bytes remaining" is 0, you got everything. If not, see [What to do when bad sectors remain](#what-to-do-when-bad-sectors-remain).
 
@@ -302,7 +302,7 @@ sudo PAUSE=1 ./disktools.sh wipe /dev/sdb
 
 ## Reading the report
 
-After an archive run, the per-case directory on the NAS contains:
+After an archive run, the per-case archive directory contains:
 
 ```
 NAS_DEST/zip-wedding-1998-20260510T143022Z/
@@ -321,7 +321,7 @@ NAS_DEST/zip-wedding-1998-20260510T143022Z/
 
 The mapfile itself (`<basename>.img.map`) stays in `SCRATCH_DIR` unless you opted to delete it. **Keep mapfiles for any case with bad bytes > 0** — they let you resume with a different drive later.
 
-A copy of `report.txt` also lands in `~/drive_reports/<basename>-report.txt` so you have a local index even if the NAS goes offline.
+A copy of `report.txt` also lands in `~/drive_reports/<basename>-report.txt` so you have a local index even if the archive destination goes offline.
 
 ---
 
@@ -391,7 +391,7 @@ sudo ddrescue -d -r16 /dev/sdc /your/scratch/.../zip-name-<ts>.img \
 ddrescuelog -t /your/scratch/.../zip-name-<ts>.img.map
 ```
 
-The `ddrescuelog -t` line tells you the current state. If `rescued:` is at 100% and `bad-sector:` is 0, you're done — remount the image, rerun rsync to the NAS case directory.
+The `ddrescuelog -t` line tells you the current state. If `rescued:` is at 100% and the unresolved counters are 0, you're done — remount the image, rerun rsync to the archive case directory.
 
 ---
 
@@ -402,7 +402,7 @@ The `ddrescuelog -t` line tells you the current state. If `rescued:` is at 100% 
 | `detect_media.sh` shows `no medium` for an optical drive that has a disc in it | Drive cached the previous (ejected) disc's state | Eject and reinsert; unplug the USB drive briefly |
 | `detect_media.sh` shows `unreadable` | First sectors are bad, or no read permission, or the drive is failing | Try imaging anyway — ddrescue handles unreadable initial sectors |
 | `archive_media.sh` aborts with "No config at:" | First-time setup not done | `cp config/archive.conf.example config/archive.conf` and edit |
-| `archive_media.sh` aborts with "NAS_DEST … is not under any mounted filesystem" | `NAS_TRANSPORT=mounted` but the share isn't actually mounted | `mountpoint -q /mnt/nas` to verify; check `/etc/fstab` and `mount -a` |
+| `archive_media.sh` aborts with "NAS_DEST … is not under a mounted NAS filesystem" | `NAS_TRANSPORT=mounted` but the share isn't actually mounted | `mountpoint -q /mnt/nas` to verify; check `/etc/fstab` and `mount -a` |
 | `archive_media.sh` aborts with "ddrescue produced an empty image" | ddrescue couldn't open the device at all (often: device disappeared between scan and run, or the device path is wrong) | Re-run `./disktools.sh detect`; check `dmesg | tail` for USB disconnects |
 | Mount step fails with "wrong fs type" | Filesystem isn't in the auto-probe list, or the image needs partition-offset mounting | Try the legacy `scripts/interactive_data_rescue.sh` for HFS+ / APM cases; or mount manually with `sudo mount -o loop,ro,offset=N -t TYPE image /mnt/...` |
 | rsync prints `EPERM`/`EINVAL` warnings | CIFS mount doesn't support xattrs/ACLs | Harmless; files copy, only metadata is skipped. Edit `copy_to_nas` to drop `-AX` flags if it bothers you |

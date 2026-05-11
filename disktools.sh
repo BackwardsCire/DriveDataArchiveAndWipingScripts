@@ -72,7 +72,7 @@ $(bold "Drive Data Archive & Wiping Toolkit")
 $(bold "===================================")
 
   1) Detect attached media          (read-only scan, no sudo needed)
-  2) Archive media to NAS           (ddrescue + multi-pass + rsync)
+  2) Archive media to storage       (ddrescue + multi-pass + rsync)
   3) Rescue from a specific device  (older interactive helper, HFS-aware)
   4) Wipe a drive for resale        (DESTRUCTIVE — irreversible)
   5) Show recent session reports

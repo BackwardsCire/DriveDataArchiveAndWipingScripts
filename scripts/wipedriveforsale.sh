@@ -288,9 +288,12 @@ else
     else
       if [[ "${ALLOW_NWIPE_ON_NVME:-0}" = "1" ]]; then
         echo "nvme format failed; ALLOW_NWIPE_ON_NVME=1 set, attempting nwipe on NVMe."
+        set +e
         { env -i PATH="$PATH" TERM="${TERM:-xterm}" HOME="$WORKDIR" XDG_CONFIG_HOME="$WORKDIR" XDG_CACHE_HOME="$WORKDIR" \
             nwipe --autonuke --method=dodshort --verify=last --nowait "$DRIVE" |& tee "$NWIPE_TTYLOG"; }
-        NWIPE_RC=${PIPESTATUS[0]}; echo "NWIPE exit code: $NWIPE_RC"
+        NWIPE_RC=${PIPESTATUS[0]}
+        set -e
+        echo "NWIPE exit code: $NWIPE_RC"
         WIPE_METHOD="nwipe DoD short (NVMe fallback)"
         WIPE_LOG_APPLIES=1
       else
@@ -300,9 +303,12 @@ else
     fi
   else
     echo "USB non-NVMe device. Using nwipe (DoD Short, verify=last) with progress UI."
+    set +e
     { env -i PATH="$PATH" TERM="${TERM:-xterm}" HOME="$WORKDIR" XDG_CONFIG_HOME="$WORKDIR" XDG_CACHE_HOME="$WORKDIR" \
         nwipe --autonuke --method=dodshort --verify=last --nowait "$DRIVE" |& tee "$NWIPE_TTYLOG"; }
-    NWIPE_RC=${PIPESTATUS[0]}; echo "NWIPE exit code: $NWIPE_RC"
+    NWIPE_RC=${PIPESTATUS[0]}
+    set -e
+    echo "NWIPE exit code: $NWIPE_RC"
     WIPE_METHOD="nwipe DoD short (verify last)"
     WIPE_LOG_APPLIES=1
   fi
@@ -362,7 +368,9 @@ if (( SMART_AVAILABLE == 0 )); then
     # Get the drive's own estimate of polling time (in minutes) and wait that
     # long with a small cushion. Fall back to 120s if the drive doesn't report.
     poll_min="$($SMARTCTL_BIN -c "$DRIVE" 2>/dev/null \
-      | awk '/Short self-test routine/{getline; if ($0 ~ /\([ \t]*[0-9]+\)/) {gsub(/[^0-9]/,"",$0); print; exit}}')"
+      | awk '/Short self-test routine/ && match($0, /\([ \t]*[0-9]+[ \t]*\)/) {
+          v=substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", v); print v; exit
+        }')"
     [[ -z "$poll_min" || ! "$poll_min" =~ ^[0-9]+$ ]] && poll_min=2
     wait_s=$(( poll_min * 60 + 15 ))
     $SMARTCTL_BIN -t short "$DRIVE" || true

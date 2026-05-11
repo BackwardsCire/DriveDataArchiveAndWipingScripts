@@ -87,6 +87,7 @@ cp -a "$SMB_CONF" "$backup"
 log "Backed up Samba config to $backup"
 
 tmp="$(mktemp)"
+trap '[[ -n "${tmp:-}" && -f "$tmp" ]] && rm -f "$tmp"' EXIT
 awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
   $0 == begin {skip=1; next}
   $0 == end {skip=0; next}
@@ -109,11 +110,12 @@ $BEGIN_MARK
 $END_MARK
 EOF
 
+log "Validating Samba config"
+testparm -s "$tmp" >/dev/null
+
 install -m 0644 "$tmp" "$SMB_CONF"
 rm -f "$tmp"
-
-log "Validating Samba config"
-testparm -s "$SMB_CONF" >/dev/null
+trap - EXIT
 
 log "Starting Samba services"
 systemctl enable --now smbd

@@ -2,7 +2,7 @@
 
 Two related Bash workflows for working with old/legacy storage on a Linux box:
 
-1. **Archive aging media to a NAS** — auto-detect Zip disks, optical drives, and legacy hard drives; image with `ddrescue` using a multi-pass / multi-tool recovery strategy; mount the image and rsync recovered files to a NAS share.
+1. **Archive aging media to local or NAS storage** — auto-detect Zip disks, optical drives, and legacy hard drives; image with `ddrescue` using a multi-pass / multi-tool recovery strategy; mount the image and rsync recovered files to your configured archive destination.
 2. **Securely wipe drives for resale** — DoD-short wipe with `nwipe`, surface scan with `badblocks`, SMART capture, and a buyer-friendly PDF report.
 
 The two workflows share helpers (logging conventions, sudo-aware home-directory handling) but are otherwise independent — you can use either without the other.
@@ -15,9 +15,9 @@ No NAS is required if you do not want one: write archives to a local path and us
 
 ### Archive workflow
 - **`scripts/detect_media.sh`** — enumerates source candidates (Zip / optical / USB / IDE) with kind classification, even when no medium is inserted. `--tsv` and `--json` output for scripting.
-- **`scripts/archive_media.sh`** — interactive orchestrator. Reads `config/archive.conf`, ensures the NAS is mounted, picks (or accepts) a device, runs ddrescue in stages with optional fallback tools (`dvdisaster`, `cdparanoia`, `safecopy`), mounts the image read-only, and rsyncs to the NAS.
+- **`scripts/archive_media.sh`** — interactive orchestrator. Reads `config/archive.conf`, ensures the archive destination is ready, picks (or accepts) a device, runs ddrescue in stages with optional fallback tools (`dvdisaster`, `cdparanoia`, `safecopy`), mounts the image read-only, and rsyncs to storage.
 - **`scripts/setup_local_samba_share.sh`** — optional helper for the no-NAS case. Installs/configures Samba so the local archive directory is shared over SMB/CIFS.
-- **`config/archive.conf.example`** — template for NAS destination, mount type (CIFS/NFS/already-mounted/local), retry counts, fallback chain.
+- **`config/archive.conf.example`** — template for archive destination, mount type (local/CIFS/NFS/already-mounted), retry counts, fallback chain.
 
 ### Wipe workflow (unchanged from earlier releases)
 - **`scripts/wipedriveforsale.sh`** — wipe + verify + report.
@@ -61,7 +61,7 @@ sudo tmux new -s disktools './disktools.sh'
 sudo apt update && sudo apt install -y gddrescue parted rsync \
   hfsprogs hfsutils dvdisaster safecopy cdparanoia file util-linux genisoimage tmux
 
-# 2. configure your NAS destination
+# 2. configure your archive destination
 cp config/archive.conf.example config/archive.conf
 $EDITOR config/archive.conf
 
@@ -97,13 +97,13 @@ detect_media.sh
       ▼
 archive_media.sh /dev/X
       │
-      ├─► verify NAS reachable (mount or check)
+      ├─► verify archive destination reachable (mount or check)
       ├─► ddrescue fast pass            (-n)
       ├─► ddrescue retry pass           (-d -r4)
       ├─► [if bad sectors] deep-scrape  (-d -R -r16)
       ├─► [optional] dvdisaster / cdparanoia / safecopy fallbacks
-      ├─► mount image read-only, rsync → NAS case directory
-      └─► write report.txt locally + on NAS
+      ├─► mount image read-only, rsync → archive case directory
+      └─► write report.txt locally + with the archived files
 ```
 
 Each step is gated and can be skipped via `DRY_RUN=1`. See [docs/recovery_strategies.md](docs/recovery_strategies.md) for the why behind each stage.
@@ -146,9 +146,9 @@ Each step is gated and can be skipped via `DRY_RUN=1`. See [docs/recovery_strate
 
 ## Outputs
 
-All artifacts go under `~/drive_reports/` of the invoking user (sudo-safe). A copy of the per-case report also lands in the NAS case directory so the report travels with the data.
+All artifacts go under `~/drive_reports/` of the invoking user (sudo-safe). A copy of the per-case report also lands in the archive case directory so the report travels with the data.
 
-Per archive case directory on the NAS: `<media-type>-<short-name>-<UTC-timestamp>/` with:
+Per archive case directory: `<media-type>-<short-name>-<UTC-timestamp>/` with:
 
 - the recovered file tree,
 - `report.txt` (sources, ddrescue exit codes, bad-byte tally, mapfile summary, destination listing),

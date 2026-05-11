@@ -1,15 +1,15 @@
 #! /usr/bin/env bash
-# archive_media.sh — interactive archiver for Zip/CD/DVD/legacy HDD to NAS.
+# archive_media.sh — archiver for Zip/CD/DVD/legacy HDD to local/NAS storage.
 #
 # Workflow:
 #   1. Load config/archive.conf (copy from .example if not present).
-#   2. Verify NAS destination is mounted/reachable.
+#   2. Verify archive destination is mounted/reachable.
 #   3. Detect candidate source media via detect_media.sh; let operator pick
 #      (or accept device path on the command line).
 #   4. ddrescue in stages: fast → retry → optional deep-scrape.
 #   5. Optional fallback tools (dvdisaster, safecopy) if bad sectors remain.
-#   6. Mount the image read-only and rsync the contents to the NAS.
-#   7. Write a per-case report locally and into the NAS case directory.
+#   6. Mount the image read-only and rsync the contents to the archive destination.
+#   7. Write a per-case report locally and into the archive case directory.
 #
 # Run under tmux. Run with sudo (ddrescue + mount need it).
 #
@@ -42,7 +42,7 @@ CONFIG_EXAMPLE="${PROJ_DIR}/config/archive.conf.example"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "No config at: $CONFIG_FILE"
-  echo "Copy ${CONFIG_EXAMPLE} to ${CONFIG_FILE}, fill in your NAS details, and rerun."
+  echo "Copy ${CONFIG_EXAMPLE} to ${CONFIG_FILE}, choose local/NAS destination settings, and rerun."
   exit 1
 fi
 # shellcheck disable=SC1090
@@ -100,6 +100,7 @@ require rsync
 require file
 require mount
 require umount
+require blkid
 
 # Optional tools — checked before use, not at startup.
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -108,17 +109,52 @@ require_config() {
   [[ -n "${!v:-}" ]] || fatal "Config error: $v is required when NAS_TRANSPORT=${NAS_TRANSPORT}."
 }
 
-# ---------- NAS reachability ----------------------------------------------
+sanitize_case_name() {
+  local s="${1:-}"
+  s="${s,,}"
+  s="${s//[^a-z0-9._-]/-}"
+  s="$(sed -E 's/-+/-/g; s/^[.-]+//; s/[.-]+$//' <<<"$s")"
+  printf '%s' "${s:0:60}"
+}
+
+suggest_case_name() {
+  local dev="$1" mtype="$2" label=""
+
+  label="$(blkid -o value -s LABEL "$dev" 2>/dev/null | head -n1 || true)"
+  if [[ -z "$label" ]]; then
+    label="$(udevadm info --query=property --name="$dev" 2>/dev/null \
+      | awk -F= '$1=="ID_FS_LABEL"{print $2; exit}')"
+  fi
+  if [[ -z "$label" && ( "$mtype" == "cd" || "$mtype" == "dvd" || "$mtype" == "optical" ) ]] && have isoinfo; then
+    label="$(isoinfo -d -i "$dev" 2>/dev/null \
+      | awk -F: '/Volume id:/ {sub(/^[ \t]+/, "", $2); print $2; exit}')"
+  fi
+
+  sanitize_case_name "${label:-}"
+}
+
+existing_parent() {
+  local path="$1"
+  while [[ ! -e "$path" && "$path" != "/" ]]; do
+    path="$(dirname "$path")"
+  done
+  printf '%s' "$path"
+}
+
+# ---------- archive destination reachability -------------------------------
 ensure_nas_mounted() {
   case "${NAS_TRANSPORT:-none}" in
     none)
       log "NAS_TRANSPORT=none — using local path: $NAS_DEST"
       mkdir -p "$NAS_DEST"
+      chown "$OWNER" "$NAS_DEST" 2>/dev/null || true
+      chmod u+rwx "$NAS_DEST" 2>/dev/null || true
       ;;
     mounted)
-      local parent
-      parent="$(findmnt -no TARGET --target "$NAS_DEST" 2>/dev/null || true)"
-      [[ -z "$parent" ]] && fatal "NAS_DEST ($NAS_DEST) is not under any mounted filesystem. Mount it first or set NAS_TRANSPORT to cifs/nfs."
+      local parent_path parent
+      parent_path="$(existing_parent "$NAS_DEST")"
+      parent="$(findmnt -no TARGET --target "$parent_path" 2>/dev/null || true)"
+      [[ -z "$parent" || "$parent" == "/" ]] && fatal "NAS_DEST ($NAS_DEST) is not under a mounted NAS filesystem. Mount it first, or use NAS_TRANSPORT=none for local storage."
       log "NAS already mounted at: $parent"
       mkdir -p "$NAS_DEST"
       ;;
@@ -157,7 +193,7 @@ ensure_nas_mounted() {
   esac
   # Writability probe
   local probe="${NAS_DEST}/.archive_write_test_${TS}"
-  : > "$probe" 2>/dev/null || fatal "NAS destination ${NAS_DEST} is not writable."
+  : > "$probe" 2>/dev/null || fatal "Archive destination ${NAS_DEST} is not writable."
   rm -f "$probe"
 }
 
@@ -197,6 +233,48 @@ guard_device() {
 
 # ---------- imaging --------------------------------------------------------
 # Globals set by image_source: IMAGE, MAPFILE, BSARG, MTYPE, BAD_BYTES, IMAGING_RC, DEEP_RC
+map_metric_bytes() {
+  local map="$1" label="$2"
+  [[ -s "$map" ]] || { echo 0; return; }
+  ddrescuelog -t "$map" 2>/dev/null \
+    | awk -v label="${label}:" '
+        $1 == label {
+          v=$2
+          unit=$3
+          gsub(/,/, "", v)
+          gsub(/[^A-Za-z]/, "", unit)
+          unit=tolower(unit)
+          n=v + 0
+          mult=1
+          if (unit ~ /^k/) mult=1000
+          else if (unit ~ /^m/) mult=1000*1000
+          else if (unit ~ /^g/) mult=1000*1000*1000
+          else if (unit ~ /^t/) mult=1000*1000*1000*1000
+          printf "%.0f\n", n * mult
+          found=1
+          exit
+        }
+        END { if (!found) print 0 }
+      '
+}
+
+update_map_status() {
+  BAD_BYTES=0
+  NON_TRIED_BYTES=0
+  NON_TRIMMED_BYTES=0
+  NON_SCRAPED_BYTES=0
+
+  if [[ -s "$MAPFILE" ]] && have ddrescuelog; then
+    BAD_BYTES="$(map_metric_bytes "$MAPFILE" bad-sector)"
+    NON_TRIED_BYTES="$(map_metric_bytes "$MAPFILE" non-tried)"
+    NON_TRIMMED_BYTES="$(map_metric_bytes "$MAPFILE" non-trimmed)"
+    NON_SCRAPED_BYTES="$(map_metric_bytes "$MAPFILE" non-scraped)"
+  fi
+
+  UNRESOLVED_BYTES=$(( BAD_BYTES + NON_TRIED_BYTES + NON_TRIMMED_BYTES + NON_SCRAPED_BYTES ))
+  log "Mapfile unresolved bytes: bad=${BAD_BYTES} non-tried=${NON_TRIED_BYTES} non-trimmed=${NON_TRIMMED_BYTES} non-scraped=${NON_SCRAPED_BYTES}"
+}
+
 run_ddrescue() {
   local timeout_value="${DDRESCUE_PASS_TIMEOUT:-}"
   if [[ -n "$timeout_value" && "$timeout_value" != "0" ]]; then
@@ -258,17 +336,10 @@ image_source() {
     fi
   fi
 
-  # Bad-sector summary from the mapfile
-  BAD_BYTES=0
-  if [[ -s "$MAPFILE" ]] && have ddrescuelog; then
-    BAD_BYTES="$(ddrescuelog -t "$MAPFILE" 2>/dev/null \
-                 | awk '/bad-sector:/ {gsub(/[^0-9]/,"",$2); print $2; exit}')"
-    BAD_BYTES="${BAD_BYTES:-0}"
-  fi
-  log "Mapfile reports ${BAD_BYTES} bad bytes"
+  update_map_status
 
   DEEP_RC=0
-  if (( BAD_BYTES > 0 )); then
+  if (( UNRESOLVED_BYTES > 0 )); then
     if [[ -n "${AUTO_DEEP_SCRAPE:-}" ]] || confirm "Run deep-scrape (reverse, -r${DEEP_RETRIES:-16})?" Y; then
       phase "ddrescue deep-scrape (-d -R -r${DEEP_RETRIES:-16})"
       if [[ "$DRY_RUN" == "1" ]]; then
@@ -283,12 +354,7 @@ image_source() {
       if [[ "$DEEP_RC" == "124" || "$DEEP_RC" == "137" ]]; then
         warn "Deep-scrape hit DDRESCUE_PASS_TIMEOUT=${DDRESCUE_PASS_TIMEOUT}; keeping the mapfile so the run can be resumed later."
       fi
-      if [[ -s "$MAPFILE" ]] && have ddrescuelog; then
-        BAD_BYTES="$(ddrescuelog -t "$MAPFILE" 2>/dev/null \
-                     | awk '/bad-sector:/ {gsub(/[^0-9]/,"",$2); print $2; exit}')"
-        BAD_BYTES="${BAD_BYTES:-0}"
-      fi
-      log "Post-deep-scrape bad bytes: ${BAD_BYTES}"
+      update_map_status
     fi
   fi
 }
@@ -303,7 +369,7 @@ image_source() {
 FALLBACK_ARTIFACTS=()
 run_fallbacks() {
   local dev="$1" mtype="$2"
-  (( BAD_BYTES > 0 )) || { log "No bad sectors remain; skipping fallback tools."; return; }
+  (( UNRESOLVED_BYTES > 0 )) || { log "No unresolved sectors remain; skipping fallback tools."; return; }
   [[ -z "${FALLBACK_TOOLS:-}" ]] && { log "No FALLBACK_TOOLS configured."; return; }
 
   IFS=',' read -r -a tools <<<"$FALLBACK_TOOLS"
@@ -373,7 +439,7 @@ run_fallbacks() {
   fi
 }
 
-# ---------- mount image and copy to NAS ------------------------------------
+# ---------- mount image and copy to archive destination ---------------------
 # parted's "fs-name" column uses names that aren't always valid mount -t
 # values. Map known divergences.
 parted_to_mount_fstype() {
@@ -433,7 +499,7 @@ copy_to_nas() {
 
   if (( mounted == 0 )); then
     warn "Could not mount image; copying raw image only."
-    cp -av "$image" "$case_dir/" || true
+    cp -av "$image" "$case_dir/"
     fix_owner "$case_dir"
     _cleanup_mount "$mnt"
     return 1
@@ -461,13 +527,17 @@ write_report() {
     echo "Case name:       ${NAME}"
     echo "Image:           ${IMAGE}"
     echo "Mapfile:         ${MAPFILE}"
-    echo "NAS destination: ${case_dir}"
+    echo "Archive destination: ${case_dir}"
     echo
     echo "---- Imaging ----"
     echo "ddrescue pass timeout: ${DDRESCUE_PASS_TIMEOUT:-disabled}"
     echo "ddrescue retry rc: ${IMAGING_RC:-?}"
     echo "ddrescue deep-scrape rc: ${DEEP_RC:-skipped}"
     echo "Bad bytes remaining: ${BAD_BYTES:-?}"
+    echo "Non-tried bytes remaining: ${NON_TRIED_BYTES:-?}"
+    echo "Non-trimmed bytes remaining: ${NON_TRIMMED_BYTES:-?}"
+    echo "Non-scraped bytes remaining: ${NON_SCRAPED_BYTES:-?}"
+    echo "Total unresolved bytes: ${UNRESOLVED_BYTES:-?}"
     echo
     echo "---- Mapfile summary ----"
     if [[ -s "$MAPFILE" ]] && have ddrescuelog; then
@@ -494,7 +564,7 @@ log "archive_media.sh starting"
 log "Config:        $CONFIG_FILE"
 log "Session log:   $SESSION_LOG"
 log "Scratch dir:   $SCRATCH_DIR"
-log "NAS dest:      $NAS_DEST"
+log "Archive dest:  $NAS_DEST"
 log "DRY_RUN=$DRY_RUN AUTO=$AUTO"
 
 ensure_nas_mounted
@@ -510,11 +580,18 @@ esac
 
 if [[ "$AUTO" == "1" ]]; then
   MTYPE="${MTYPE_OVERRIDE:-$DEFAULT_MTYPE}"
-  NAME="${NAME_OVERRIDE:-auto-${TS}}"
+  SUGGESTED_NAME="$(suggest_case_name "$SRC" "$MTYPE")"
+  NAME="${NAME_OVERRIDE:-${SUGGESTED_NAME:-auto-${TS}}}"
 else
   read -rp "Media type [cd|dvd|zip|hdd] (default: ${DEFAULT_MTYPE}): " MTYPE
   MTYPE="${MTYPE:-$DEFAULT_MTYPE}"
-  read -rp "Short case name (no spaces): " NAME
+  SUGGESTED_NAME="$(suggest_case_name "$SRC" "$MTYPE")"
+  if [[ -n "$SUGGESTED_NAME" ]]; then
+    read -rp "Short case name (default: ${SUGGESTED_NAME}): " NAME
+    NAME="${NAME:-$SUGGESTED_NAME}"
+  else
+    read -rp "Short case name (no spaces): " NAME
+  fi
   [[ -z "$NAME" ]] && fatal "Case name is required."
 fi
 
@@ -531,13 +608,13 @@ echo "Source:      $SRC"
 echo "Media type:  $MTYPE"
 echo "Case base:   $BASE"
 echo "Image (loc): ${SCRATCH_DIR}/${BASE}.img"
-echo "Dest (NAS):  $CASE_DIR"
+echo "Dest:        $CASE_DIR"
 pause "Plan looks right?"
 
 image_source "$SRC" "$MTYPE" "$BASE"
 run_fallbacks "$SRC" "$MTYPE"
 
-phase "Mount image and copy to NAS"
+phase "Mount image and copy to archive destination"
 copy_to_nas "$IMAGE" "$CASE_DIR" || warn "Copy step had issues."
 
 REPORT="${CASE_DIR}/report.txt"

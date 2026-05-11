@@ -66,7 +66,7 @@ cp config/archive.conf.example config/archive.conf
 ## Verify tools are reachable
 ```bash
 # Archive workflow
-command -v ddrescue ddrescuelog parted rsync file mount tmux isoinfo
+command -v ddrescue ddrescuelog parted rsync file mount tmux blkid isoinfo
 
 # Optional fallbacks (missing ones are just skipped at runtime)
 command -v dvdisaster cdparanoia safecopy

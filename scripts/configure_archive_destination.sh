@@ -18,7 +18,18 @@ CONFIG_FILE="${CONFIG:-${PROJ_DIR}/config/archive.conf}"
 CONFIG_EXAMPLE="${PROJ_DIR}/config/archive.conf.example"
 
 usage() {
-  sed -n '2,13p' "$0"
+  cat <<'EOF'
+configure_archive_destination.sh - toggle archive.conf between local/NAS modes.
+
+Usage:
+  ./scripts/configure_archive_destination.sh local [path]
+  ./scripts/configure_archive_destination.sh mounted <dest-path>
+  ./scripts/configure_archive_destination.sh cifs <//server/share> <mountpoint> <dest-path> <credentials-file>
+  ./scripts/configure_archive_destination.sh nfs <server:/export> <mountpoint> <dest-path>
+
+Defaults:
+  local path: /srv/legacy-media
+EOF
 }
 
 ensure_config() {
@@ -29,14 +40,28 @@ ensure_config() {
 }
 
 set_key() {
-  local key="$1" value="$2" escaped
+  local key="$1" value="$2" escaped tmp
   escaped="${value//\\/\\\\}"
   escaped="${escaped//\"/\\\"}"
+  tmp="$(mktemp)"
   if grep -qE "^${key}=" "$CONFIG_FILE"; then
-    sed -i -E "s|^${key}=.*|${key}=\"${escaped}\"|" "$CONFIG_FILE"
+    awk -v key="$key" -v value="$escaped" '
+      $0 ~ "^" key "=" { print key "=\"" value "\""; next }
+      { print }
+    ' "$CONFIG_FILE" > "$tmp"
   else
-    printf '%s="%s"\n' "$key" "$escaped" >> "$CONFIG_FILE"
+    cat "$CONFIG_FILE" > "$tmp"
+    printf '%s="%s"\n' "$key" "$escaped" >> "$tmp"
   fi
+  install -m 0644 "$tmp" "$CONFIG_FILE"
+  rm -f "$tmp"
+}
+
+require_nonempty_args() {
+  local arg
+  for arg in "$@"; do
+    [[ -n "$arg" ]] || { echo "All arguments for mode '$mode' must be non-empty." >&2; usage >&2; exit 1; }
+  done
 }
 
 mode="${1:-}"
@@ -51,18 +76,21 @@ ensure_config
 case "$mode" in
   local|none)
     dest="${1:-/srv/legacy-media}"
+    require_nonempty_args "$dest"
     set_key NAS_TRANSPORT none
     set_key NAS_DEST "$dest"
     echo "Archive destination set to local mode: $dest"
     ;;
   mounted)
     [[ $# -eq 1 ]] || { usage >&2; exit 1; }
+    require_nonempty_args "$1"
     set_key NAS_TRANSPORT mounted
     set_key NAS_DEST "$1"
     echo "Archive destination set to already-mounted NAS path: $1"
     ;;
   cifs)
     [[ $# -eq 4 ]] || { usage >&2; exit 1; }
+    require_nonempty_args "$1" "$2" "$3" "$4"
     set_key NAS_TRANSPORT cifs
     set_key NAS_CIFS_SHARE "$1"
     set_key NAS_CIFS_MOUNTPOINT "$2"
@@ -72,6 +100,7 @@ case "$mode" in
     ;;
   nfs)
     [[ $# -eq 3 ]] || { usage >&2; exit 1; }
+    require_nonempty_args "$1" "$2" "$3"
     set_key NAS_TRANSPORT nfs
     set_key NAS_NFS_EXPORT "$1"
     set_key NAS_NFS_MOUNTPOINT "$2"
