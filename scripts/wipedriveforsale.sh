@@ -57,7 +57,23 @@ if [[ -n "${SUDO_USER:-}" ]]; then
 else
   USER_HOME="$HOME"
 fi
-WORKDIR="${USER_HOME}/drive_reports"
+
+# Optionally honor REPORT_ROOT from archive.conf so wipe + archive reports
+# end up under the same tree (typically a Samba/NAS share). Falls back to
+# ~/drive_reports when archive.conf is absent or REPORT_ROOT isn't set.
+WIPE_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+WIPE_PROJ_DIR="$(cd -- "${WIPE_SCRIPT_DIR}/.." &>/dev/null && pwd)"
+ARCHIVE_CONF="${WIPE_PROJ_DIR}/config/archive.conf"
+if [[ -f "$ARCHIVE_CONF" ]]; then
+  set +u
+  # shellcheck disable=SC1090
+  source "$ARCHIVE_CONF" 2>/dev/null || true
+  set -u
+fi
+WORKDIR="${REPORT_ROOT:-${USER_HOME}/drive_reports}"
+# Expand ~/ and $HOME against the invoking user (not root under sudo).
+WORKDIR="${WORKDIR/#\~/$USER_HOME}"
+WORKDIR="${WORKDIR//\$HOME/$USER_HOME}"
 mkdir -p "$WORKDIR"
 
 SESSION_LOG="${WORKDIR}/session_${TS_START}.log"

@@ -68,8 +68,19 @@ Supported source media (archive workflow):
                   hfsplus, hfs, ext2/3/4. Partitioned images: first
                   usable partition is mounted automatically; for
                   multi-partition rescues use scripts/interactive_data_rescue.sh.
-  HFS / APM       Old-Mac media with Apple Partition Map. Best handled
-                  by the legacy rescue script (menu option 3).
+  HFS / APM       Plain HFS / HFS+ filesystems (no partition map) are
+                  handled by menu option 2 — that script auto-tries
+                  hfs and hfsplus mounts. Apple Partition Map discs
+                  (old-Mac install media, System 7-9 / early OS X HDDs)
+                  need menu option 3, which has APM-aware partition
+                  walking and an hfsutils fallback.
+
+Workflow tip:
+
+  Always try option 2 first. If it says "Could not mount image; copying
+  raw image only", THEN try option 3 against the same source. Option 3
+  is only needed for the small minority of media where option 2's
+  auto-detection isn't enough.
 
 Wipe workflow targets:
 
@@ -120,8 +131,8 @@ Supported source media: Zip 100/250/750, Jaz, CD-ROM/CD-R, audio CD,
 DVD-ROM/DVD-R, USB/IDE/SATA hard drives, HFS/APM old-Mac media.
 
   1) Detect attached media          (read-only scan, no sudo needed)
-  2) Archive a disk/disc            (Zip, CD/DVD, HDD → ddrescue + rsync)
-  3) Rescue HFS / old-Mac media     (legacy helper, APM-aware)
+  2) Archive any disk/disc          (auto-detects ISO/UDF/FAT/NTFS/HFS/ext)
+  3) Rescue Apple Partition Map     (only for old-Mac install discs/HDDs)
   4) Wipe a drive for resale        (USB by default — DESTRUCTIVE)
   5) Show recent session reports
   6) Set up local SMB/CIFS share    (no NAS; share copied media from this box)

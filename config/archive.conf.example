@@ -55,6 +55,18 @@ DDRESCUE_PASS_TIMEOUT="3h"
 FALLBACK_TOOLS="dvdisaster,safecopy"
 
 # ---- Reporting ------------------------------------------------------------
-# Where session logs and per-case reports go on the LOCAL machine.
-# A copy of the report is also written into the NAS case directory.
-REPORT_ROOT="~/drive_reports"
+# Where ALL session logs and per-case reports go (archive + wipe workflows).
+# Default lives under NAS_DEST so reports are reachable from the same share
+# that holds the archived data — useful when you're wiping drives on one
+# machine and pulling the buyer-facing report from another over SMB.
+#
+# Notes:
+#   - For NAS_TRANSPORT=cifs/nfs, the share must be mountable when a script
+#     opens its session log (early in the run). The 'mounted' transport with
+#     a fstab entry is the most reliable pattern for shared reports.
+#   - Set to "$HOME/drive_reports" or "~/drive_reports" if you'd rather keep
+#     reports local even when archives go to the NAS. The wipe script will
+#     fall back to ~/drive_reports automatically when archive.conf is absent.
+#   - archive_media.sh still also writes report.txt INSIDE the per-case
+#     directory under NAS_DEST so the report travels with the data.
+REPORT_ROOT="${NAS_DEST}/drive_reports"
