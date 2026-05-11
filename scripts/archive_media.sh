@@ -827,7 +827,7 @@ else
   MTYPE="${MTYPE:-$DEFAULT_MTYPE}"
   SUGGESTED_NAME="$(suggest_case_name "$SRC" "$MTYPE")"
   if [[ -n "$SUGGESTED_NAME" ]]; then
-    read -rp "Disc folder name [detected: \"${SUGGESTED_NAME}\"]: " NAME
+    read -rp "Disc folder name [enter to accept detected: \"${SUGGESTED_NAME}\"]: " NAME
     NAME="${NAME:-$SUGGESTED_NAME}"
   else
     read -rp "Disc folder name (no spaces): " NAME
