@@ -8,6 +8,7 @@
 #   ./disktools.sh wipe <dev>      # straight to wipedriveforsale.sh
 #   ./disktools.sh setup-share     # configure a local Samba/SMB share
 #   ./disktools.sh dest local      # set archive destination mode
+#   ./disktools.sh supported       # list source media types this toolkit handles
 #   ./disktools.sh status          # list recent ~/drive_reports entries
 #
 # The detect path runs without sudo. The archive/rescue/wipe paths need
@@ -35,6 +36,7 @@ disktools.sh — single entry point for archive, rescue, wipe, and setup tasks.
 Usage:
   ./disktools.sh                 Interactive menu
   ./disktools.sh detect          Read-only media scan
+  ./disktools.sh supported       List source media types this toolkit handles
   sudo ./disktools.sh archive [dev]
   sudo ./disktools.sh rescue
   sudo ./disktools.sh wipe <dev>
@@ -44,6 +46,44 @@ Usage:
   ./disktools.sh dest cifs //nas/share /mnt/nas /mnt/nas/legacy-media /root/.smbcredentials-nas
   ./disktools.sh dest nfs nas:/export /mnt/nas /mnt/nas/legacy-media
   ./disktools.sh status
+EOF
+}
+
+show_supported() {
+  cat <<'EOF'
+Supported source media (archive workflow):
+
+  Zip / Jaz       Iomega Zip 100, Zip 250, Zip 750, Jaz 1GB/2GB
+                  Detected by vendor/model (Iomega, Zip, Jaz) or by size
+                  heuristic (~100 / ~240 / ~750 MB removable).
+  Optical         CD-ROM, CD-R, audio CD (cdparanoia fallback), DVD-ROM,
+                  DVD-R, DVD+R. Detected as kind=optical.
+  Hard drives     USB-attached or USB-bridged IDE/SATA disks. Mountable
+                  filesystems auto-tried: iso9660, udf, vfat, ntfs-3g,
+                  hfsplus, hfs, ext2/3/4. Partitioned images: first
+                  usable partition is mounted automatically; for
+                  multi-partition rescues use scripts/interactive_data_rescue.sh.
+  HFS / APM       Old-Mac media with Apple Partition Map. Best handled
+                  by the legacy rescue script (menu option 3).
+
+Wipe workflow targets:
+
+  USB / removable Default. SATA/IDE drives via USB enclosure.
+  NVMe            Secure-erase via `nvme format -s1` when device is
+                  /dev/nvmeXn1. Internal NVMe requires ALLOW_NONUSB=1.
+  Non-USB         Blocked by default; override with ALLOW_NONUSB=1.
+
+Not supported:
+
+  Floppy disks    No imaging path wired up (USB floppies usually appear
+                  as /dev/sd? — you can try `archive` with mtype=hdd
+                  but the recovery heuristics aren't tuned for them).
+  Tape drives     Out of scope.
+  Mixed-mode CDs  Data session archives fine; audio session needs
+                  cdparanoia configured in FALLBACK_TOOLS.
+
+Run `./disktools.sh detect` to see what the kernel currently sees,
+or `docs/USAGE.md` for per-media-type walkthroughs.
 EOF
 }
 
@@ -71,13 +111,17 @@ show_menu() {
 $(bold "Drive Data Archive & Wiping Toolkit")
 $(bold "===================================")
 
+Supported source media: Zip 100/250/750, Jaz, CD-ROM/CD-R, audio CD,
+DVD-ROM/DVD-R, USB/IDE/SATA hard drives, HFS/APM old-Mac media.
+
   1) Detect attached media          (read-only scan, no sudo needed)
-  2) Archive media to storage       (ddrescue + multi-pass + rsync)
-  3) Rescue from a specific device  (older interactive helper, HFS-aware)
-  4) Wipe a drive for resale        (DESTRUCTIVE — irreversible)
+  2) Archive a disk/disc            (Zip, CD/DVD, HDD → ddrescue + rsync)
+  3) Rescue HFS / old-Mac media     (legacy helper, APM-aware)
+  4) Wipe a drive for resale        (USB by default — DESTRUCTIVE)
   5) Show recent session reports
   6) Set up local SMB/CIFS share    (no NAS; share copied media from this box)
   7) Configure archive destination  (local/NAS mode)
+  m) Show full supported-media list
   q) Quit
 
 EOF
@@ -150,6 +194,7 @@ EOF
         *) echo "Unknown mode: $mode"; exit 1 ;;
       esac
       ;;
+    m|M) show_supported ;;
     q|Q|"") echo "Bye."; exit 0 ;;
     *) echo "Unknown choice: $choice"; exit 1 ;;
   esac
@@ -187,6 +232,9 @@ case "${1:-menu}" in
     exec "$SCRIPTS/configure_archive_destination.sh" "$@"
     ;;
   status|s)    status_summary ;;
+  supported|media|m)
+    show_supported
+    ;;
   -h|--help|help)
     show_help
     ;;
