@@ -177,8 +177,25 @@ EOF
       echo "Type 'wipe' (lowercase) to continue, anything else to cancel."
       read -rp "Confirm: " c
       [[ "$c" == "wipe" ]] || { echo "Cancelled."; exit 1; }
-      read -rp "Target device path (e.g. /dev/sdb): " dev
-      [[ -b "$dev" ]] || { echo "Not a block device: $dev"; exit 1; }
+      # Prompt for a device path; blank input runs a read-only detect
+      # scan so the operator can see what's actually attached before
+      # typing the path. The wipedriveforsale.sh script then runs its
+      # own per-device "type YES" gate against the chosen target.
+      dev=""
+      while :; do
+        read -rp "Target device path (blank to scan, e.g. /dev/sdb): " dev
+        if [[ -z "$dev" ]]; then
+          echo
+          "$SCRIPTS/detect_media.sh" || true
+          echo
+          continue
+        fi
+        if [[ ! -b "$dev" ]]; then
+          echo "Not a block device: $dev (blank input shows a detect scan)"
+          continue
+        fi
+        break
+      done
       exec "$SCRIPTS/wipedriveforsale.sh" "$dev"
       ;;
     5) status_summary ;;
