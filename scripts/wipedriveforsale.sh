@@ -553,5 +553,16 @@ mkdir -p "$FINAL_DIR"
 mv "${WORKDIR}/${BASE}"* "$FINAL_DIR/" 2>/dev/null || true
 mv "$SESSION_LOG" "$FINAL_DIR/" 2>/dev/null || true
 
+# Re-apply ownership AFTER the classification dir is created and populated.
+# STEP 13's chown happened before mkdir SUCCESS/FAILED, so the final dir
+# was left root-owned (mode 0700 from the script's umask 077) and the
+# invoking user couldn't enter it without sudo. Also widen group access so
+# share consumers (e.g. the legacymedia samba group inherited via the
+# share's setgid bit) can read the report without sudo on the LAN side.
+if [[ -n "${SUDO_USER:-}" ]]; then
+  chown -R "$SUDO_USER" "$FINAL_DIR" 2>/dev/null || true
+  chmod -R u+rwX,g+rX "$FINAL_DIR" 2>/dev/null || true
+fi
+
 pause_here "Files moved to: $FINAL_DIR. Press Enter to finish."
 echo; echo "Done. Reports in: $FINAL_DIR"
