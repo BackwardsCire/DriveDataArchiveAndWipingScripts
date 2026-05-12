@@ -1,0 +1,20 @@
+# Operator-generated artifacts — never commit these.
+# Reports + logs land under REPORT_ROOT (see config/archive.conf), but
+# if a stray one ever ends up in the working tree it shouldn't make it
+# into git.
+*.pdf
+*.typescript
+session_*.log
+archive_*.log
+rescue_*.log
+nwipe_report_*
+
+# Personal config (the .example is the template; the real one stays local).
+config/archive.conf
+
+# Scratch + recovery output if anyone ever runs the scripts from inside
+# the repo tree by accident.
+/recovery/
+/RecoveredData/
+/mnt/
+/drive_reports/

@@ -85,6 +85,22 @@ timestamp(){ date -u +'%Y-%m-%d %H:%M:%S UTC'; }
 phase(){ echo; echo "===== $(timestamp) :: $* ====="; }
 run(){ local label="$1"; shift; phase "$label"; local s=$(date +%s) rc; "$@"; rc=$?; local e=$(date +%s); echo "[$label] exit=$rc elapsed=$((e-s))s"; return $rc; }
 
+# Strip ANSI/curses escape sequences from a file in place. nwipe's TUI
+# logs cursor positioning + color codes intermixed with the actual text;
+# cat'ing the raw transcript later is unreadable. We don't try to
+# reconstruct the live screen — just remove the escape codes so the
+# residual text (config, final summary, errors) is grep-able.
+strip_ansi() {
+  [[ -f "$1" ]] || return 0
+  sed -i -E '
+    s/\x1b\[[0-9;?]*[A-Za-z]//g
+    s/\x1b\][^\x07]*\x07//g
+    s/\x1b[()][AB012]//g
+    s/\x1b[=>]//g
+    s/\(B\(B//g
+  ' "$1" 2>/dev/null || true
+}
+
 # ====== STEP 1: Pre-flight ====================================================
 if [[ $EUID -ne 0 ]]; then echo "Error: run as root (sudo $0 /dev/XYZ)" >&2; exit 1; fi
 if [[ $# -ne 1 ]]; then echo "Usage: $0 /dev/sdX_or_nvmeXn1" >&2; exit 1; fi
@@ -319,7 +335,7 @@ else
         echo "nvme format failed; ALLOW_NWIPE_ON_NVME=1 set, attempting nwipe on NVMe."
         set +e
         { env -i PATH="$PATH" TERM="${TERM:-xterm}" HOME="$WORKDIR" XDG_CONFIG_HOME="$WORKDIR" XDG_CACHE_HOME="$WORKDIR" \
-            nwipe --autonuke --method=dodshort --verify=last --nowait "$DRIVE" |& tee "$NWIPE_TTYLOG"; }
+            nwipe --autonuke --method=dodshort --verify=last --nowait --PDFreportpath="$WORKDIR" "$DRIVE" |& tee "$NWIPE_TTYLOG"; }
         NWIPE_RC=${PIPESTATUS[0]}
         set -e
         echo "NWIPE exit code: $NWIPE_RC"
@@ -334,7 +350,7 @@ else
     echo "USB non-NVMe device. Using nwipe (DoD Short, verify=last) with progress UI."
     set +e
     { env -i PATH="$PATH" TERM="${TERM:-xterm}" HOME="$WORKDIR" XDG_CONFIG_HOME="$WORKDIR" XDG_CACHE_HOME="$WORKDIR" \
-        nwipe --autonuke --method=dodshort --verify=last --nowait "$DRIVE" |& tee "$NWIPE_TTYLOG"; }
+        nwipe --autonuke --method=dodshort --verify=last --nowait --PDFreportpath="$WORKDIR" "$DRIVE" |& tee "$NWIPE_TTYLOG"; }
     NWIPE_RC=${PIPESTATUS[0]}
     set -e
     echo "NWIPE exit code: $NWIPE_RC"
@@ -342,6 +358,13 @@ else
     WIPE_LOG_APPLIES=1
   fi
 fi
+# Clean up the captured nwipe transcript so it's readable as text.
+# nwipe drives the screen with cursor positioning, so the residual file
+# is mostly the static config + spinner spam + the final status row;
+# stripping ANSI gives you something grep-friendly without losing the
+# wipe-completion line.
+[[ -f "$NWIPE_TTYLOG" ]] && strip_ansi "$NWIPE_TTYLOG"
+
 pause_here "Wipe phase complete (NWIPE_RC=${NWIPE_RC:-?}). Continue to wipefs?"
 
 # ====== STEP 7: Clear filesystem signatures ==================================
@@ -424,10 +447,9 @@ build_smart_summary() {
   local HEALTH POH PWR_CYC REALLOC PENDING UNCORR CRC TEMP ERRLOG SELFTEST
   HEALTH="$(
     awk -F': ' '
-      /SMART overall-health self-assessment test result:/ {print $2; f=1}
-      /SMART Health Status:/ {print $2; f=1}
-    END{ if(!f) print "" }
-  ' "$SMART_TXT" | sed 's/[[:space:]]*$//'
+      /SMART overall-health self-assessment test result:/ {print $2; exit}
+      /SMART Health Status:/ {print $2; exit}
+    ' "$SMART_TXT" | sed 's/[[:space:]]*$//'
   )"
   POH="$(smart_raw 9 Power_On_Hours)"
   PWR_CYC="$(smart_raw 12 Power_Cycle_Count)"
