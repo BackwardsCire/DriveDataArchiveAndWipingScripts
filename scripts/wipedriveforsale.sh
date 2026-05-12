@@ -109,18 +109,31 @@ pause_here "Pre-flight checks passed. Continue?"
 
 # ====== STEP 2: USB/removable guard + system safety ==========================
 ALLOW_NONUSB="${ALLOW_NONUSB:-0}"  # default block non-USB/removable
+# Three independent USB signals — accept any one. ID_BUS=usb is the cleanest
+# but many cheap USB-SATA bridges (especially newer USB-3 ones, common with
+# desktop-drive enclosures) don't propagate it through udev. lsblk's TRAN
+# column reads the kernel's transport directly and is much more reliable.
+# RM=1 catches sticks / SD-card readers that present as removable media.
 if udevadm info --query=property --name="$DRIVE" 2>/dev/null | grep -q '^ID_BUS=usb'; then
   IS_USB=1
 else
   IS_USB=0
 fi
+TRAN="$(lsblk -dn -o TRAN "$DRIVE" 2>/dev/null | awk '{print $1}')"
 RM_FLAG="$(lsblk -dn -o RM "$DRIVE" 2>/dev/null || echo 0)"
-if [[ "$ALLOW_NONUSB" = "0" && "$IS_USB" != "1" && "$RM_FLAG" != "1" ]]; then
+USB_VIA_TRAN=0
+[[ "$TRAN" == "usb" ]] && USB_VIA_TRAN=1
+if [[ "$ALLOW_NONUSB" = "0" && "$IS_USB" != "1" && "$USB_VIA_TRAN" != "1" && "$RM_FLAG" != "1" ]]; then
   echo "FATAL: $DRIVE not detected as USB/removable. Set ALLOW_NONUSB=1 to override."
+  echo "  ID_BUS:    $(udevadm info --query=property --name="$DRIVE" 2>/dev/null | awk -F= '/^ID_BUS=/{print $2; exit}')"
+  echo "  lsblk TRAN: ${TRAN:-?}"
+  echo "  lsblk RM:   ${RM_FLAG:-?}"
   exit 1
 fi
-if [[ "$IS_USB" != "1" ]]; then
-  echo "WARN: $DRIVE is not tagged ID_BUS=usb (RM=$RM_FLAG). Proceeding."
+if [[ "$IS_USB" != "1" && "$USB_VIA_TRAN" = "1" ]]; then
+  echo "INFO: $DRIVE not tagged ID_BUS=usb but lsblk reports TRAN=usb (USB-SATA bridge passthrough). Proceeding."
+elif [[ "$IS_USB" != "1" ]]; then
+  echo "WARN: $DRIVE is not tagged ID_BUS=usb (TRAN=${TRAN:-?}, RM=$RM_FLAG). Proceeding."
 fi
 
 ROOTSRC="$(findmnt -no SOURCE / 2>/dev/null || true)"
