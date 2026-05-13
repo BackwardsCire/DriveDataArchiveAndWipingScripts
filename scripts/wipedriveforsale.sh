@@ -437,7 +437,17 @@ pause_here "SMART self-test phase done. Continue to summary/report?"
 
 # ====== STEP 10: Build concise SMART summary (buyer-facing) ==================
 smart_raw() {  # usage: smart_raw <ID> <NAME_WITH_UNDERSCORES>
-  awk -v id="$1" -v name="$2" '$1==id && $2==name {print $NF}' "$SMART_TXT" | tail -n1
+  # smartctl -a's attribute table is fixed-width:
+  #   ID# ATTRIBUTE_NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW_VALUE
+  # so column 10 is RAW_VALUE. The previous `print $NF` grabbed the very
+  # last whitespace token, which broke on drives (Seagate, some HGST)
+  # that append historical info in parentheses after the raw value,
+  # e.g. "28 (0 18 0 0 0)" → $NF was "0)" instead of "28".
+  #
+  # SMART_TXT contains TWO snapshots (initial + post-self-test). The
+  # buyer-facing summary wants the FINAL state, so we keep the last
+  # match rather than exiting on the first.
+  awk -v id="$1" -v name="$2" '$1==id && $2==name {val=$10} END {print val}' "$SMART_TXT"
 }
 build_smart_summary() {
   if (( SMART_AVAILABLE != 0 )) || [[ ! -s "$SMART_TXT" ]]; then
